@@ -39,6 +39,7 @@ from anemoi.training.utils.checkpoint import transfer_learning_loading
 from anemoi.training.utils.jsonify import map_config_to_primitives
 from anemoi.training.utils.seeding import get_base_seed
 from anemoi.utils.provenance import gather_provenance_info
+from anemoi.models.layers.utils import user_annotate_children
 
 LOGGER = logging.getLogger(__name__)
 
@@ -523,7 +524,10 @@ class AnemoiTrainer:
         )
 
         LOGGER.debug("Starting training..")
-
+        
+        # add user annotations for the anemoi profiler to each module
+        user_annotate_children(self.model)
+        
         trainer.fit(
             self.model,
             datamodule=self.datamodule,

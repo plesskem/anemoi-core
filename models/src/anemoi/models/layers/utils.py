@@ -104,37 +104,32 @@ class ProfilerWrapper(nn.Module):
         
         # Register backward hook for profiling backward pass
         #self.register_full_backward_hook(self._backward_hook)
-        self.register_full_backward_pre_hook(self._backward_pre_hook)
+       # self.register_full_backward_pre_hook(self._backward_pre_hook)
 
     def forward(self, *args, **kwargs):
-        #print(f"{args=}, {kwargs=}")
-        if(self.enabled):
-            cuda.nvtx.range_push(self.marker)
         #tracing_marker=marker.split('- ')[1].split(', input')[0]
         with torch.autograd.profiler.record_function("anemoi-"+self.marker):
             out = self.module(*args, **kwargs)
-        if(self.enabled):
-            cuda.nvtx.range_pop()
         return out
-    
-    def _backward_pre_hook(self, module, grad_output):
-        """Hook function called before the backward pass"""
+ 
 
-        #pop any existing ranges
-        cuda.nvtx.range_pop()
-        cuda.nvtx.range_push(f"{self.marker}_backward")
-        
-        return grad_output  # Return unchanged gradients
+def user_annotate_children(model: nn.Module, prefix: str = '') -> nn.Module:
+    def add_annotations_to_forward(name, module):
+        # ensure original forward is stored only once
+        if not hasattr(module, "_forward"):
+            module._forward = module.forward
 
-@contextmanager
-def nvtx_wrapper(marker, enabled=True, blocking=True):
-    if(enabled):
-        cuda.nvtx.range_push(marker)
-       # if(blocking):
-           # torch.cuda.synchronize()
-        #if blocking and 'CUDA_LAUNCH_BLOCKING' not in os.environ:
-           # os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+        def annotated_forward(*args, **kwargs):
+            parts = [part for part in name.split('.') if not part.isdigit()]
+            marker = f"{module.__class__.__name__}-{'.'.join(parts)}"
+            with torch.profiler.record_function(f"ANEMOI-{marker}.forward"):
+                return module._forward(*args, **kwargs)
+        return annotated_forward
+    for child_name, child in model.named_children():
+        child.forward = add_annotations_to_forward(f"{prefix}{child_name}", child)
+        user_annotate_children(child, prefix=f"{prefix}{child_name}.")
 
-    yield
-    if(enabled):
-        cuda.nvtx.range_pop()
+    # handle leaf (no children)
+    if len(list(model.children())) == 0:
+        model.forward = add_annotations_to_forward(f"{prefix}(LEAF)", model)
+    return model
