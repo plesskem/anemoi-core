@@ -8,12 +8,203 @@ from typing import List, Tuple
 import re
 import os
 import logging
+import pandas as pd
 from rich.console import Console
 LOGGER = logging.getLogger(__name__)
 console = Console(record=True, width=200)
 
 filename="/ec/res4/scratch/naco/aifs/outputs/raps/train/4N_16gpn_transformer_512c_o1280.jobname-619791/train-outputs/profiler/e5c4bd0471a2494f9183bdf493fafc7a/ac6-306.bullx_621045.None.1743008762865142923.pt.trace.json"
 
+### new trace analysing methods
+
+def trace_to_dataframe(trace_file: str, cols=[]) -> pd.DataFrame:
+    """
+    Reads a PyTorch Lightning Profiler trace JSON file and converts it
+    into a pandas DataFrame with selected columns: (default) cat, name, ts, dur,
+    plus end_time and rank.
+    
+    Parameters:
+        trace_file (str): Path to the JSON trace file.
+    
+    Returns:
+        pd.DataFrame: DataFrame containing the trace events.
+    """
+    # Load the JSON trace
+    with open(trace_file, "r") as f:
+        trace_data = json.load(f)
+    
+    # Extract rank from distributedInfo if it exists
+    rank = None
+    if "distributedInfo" in trace_data:
+        rank = trace_data["distributedInfo"].get("rank")
+
+    # Ensure traceEvents exist
+    if "traceEvents" not in trace_data:
+        raise ValueError("The JSON file does not contain 'traceEvents'.")
+    
+    # Extract relevant fields and compute end_time
+    events = []
+    if len(cols) == 0:
+        cols=["cat", "name", "ts", "dur"]
+    for event in trace_data["traceEvents"]:
+        events.append({k: event[k] for k in cols if k in event})
+       # if all(k in event for k in ["cat", "name", "ts"]):
+       #     dur = event.get("dur", 0)  # default dur to 0 if missing # maybe later adding memory information to it ?
+       #     events.append({
+       #         "cat": event["cat"],
+       #         "name": event["name"],
+       #         "ts": event["ts"],
+       #         "end_time": event["ts"] + dur,
+       #         "rank": rank
+       #     })
+    
+    # Convert to DataFrame
+    df = pd.DataFrame(events)
+    df["rank"]=rank
+    return df
+
+
+def merge_overlapping_intervals_df(df, start_col="ts", end_col="end_time", cat_col=None, threshold=0.0):
+    """
+    Merge overlapping time intervals in a pandas DataFrame into non-overlapping batches.
+
+    Args:
+        df (pd.DataFrame): Input DataFrame with start and end time columns
+        start_col (str): Name of the start time column
+        end_col (str): Name of the end time column
+        cat_col (str, optional): Column to group by before merging (e.g. category)
+        threshold (float): Minimum gap allowed to still merge intervals
+
+    Returns:
+        pd.DataFrame: DataFrame with merged intervals
+    """
+
+    def _merge(intervals):
+        if not intervals:
+            return []
+
+        # Sort intervals by start time
+        intervals = sorted(intervals, key=lambda x: x[0])
+        merged = [intervals[0]]
+
+        for current in intervals[1:]:
+            last_start, last_end = merged[-1]
+            cur_start, cur_end = current
+
+            if cur_start <= last_end or cur_start - last_end < threshold:
+                merged[-1] = (last_start, max(last_end, cur_end))
+            else:
+                merged.append(current)
+
+        return merged
+    merged_results = []
+
+    if cat_col:
+        for cat, group in df.groupby(cat_col):
+            intervals = list(zip(group[start_col], group[end_col]))
+            merged = _merge(intervals)
+            merged_results.extend([{cat_col: cat, start_col: s, end_col: e} for s, e in merged])
+    else:
+        intervals = list(zip(df[start_col], df[end_col]))
+        merged = _merge(intervals)
+        merged_results = [{start_col: s, end_col: e} for s, e in merged]
+
+    return pd.DataFrame(merged_results)
+
+def get_runtime_breakdown(df: pd.DataFrame, categories=[], names_list=[], no_names=[], regex=True):
+    # total time recorded
+    start_time=df['ts'].min()
+    end_time=df['end_time'].max()
+    total_time=(end_time-start_time)
+    filtered_times=[]
+    rest_times=[]
+    df_result=[]
+    for names in names_list:
+        regex_pattern_cat = "|".join(categories)
+        regex_pattern_name = "|".join(names)
+        regex_pattern_no_name = "|".join(no_names)
+        col1='cat'
+        col2='name'
+        df_out=df
+        if len(categories) != 0:
+            df_out=df[df[col1].str.contains(regex_pattern_cat, regex=regex, na=False)].sort_values(by='ts')
+        # print("CAT")
+        # print(gpu_df.head())
+        if len(names) != 0:
+            df_out=df_out[df_out[col2].str.contains(regex_pattern_name, regex=True, na=False)].sort_values(by='ts')
+        #  print("NAME")
+        #   print(gpu_df.head())
+        if len(no_names) != 0:
+            df_out=df_out[~df_out[col2].str.contains(regex_pattern_no_name, regex=True, na=False)].sort_values(by='ts')
+        #   print("NONAME")
+        #   print(gpu_df.head())
+
+        df_out=merge_overlapping_intervals_df(df_out[[col1,'ts','end_time']])
+        df_out['batch_dur']=df_out['end_time']-df_out['ts']
+    # print(gpu_df_merged.head())
+        filtered_time=df_out['batch_dur'].sum()
+        idle_time=total_time-filtered_time
+        filtered_times.append(filtered_time)
+        rest_times.append(idle_time)
+        df_result.append(df_out)
+    merged_df = pd.concat(df_result, ignore_index=True)
+    merged_df=merge_overlapping_intervals_df(merged_df[['ts','end_time']])
+    #print(merged_df.head())
+    merged_df['batch_dur']=merged_df['end_time']-merged_df['ts']
+    total_filtered_time=merged_df['batch_dur'].sum()
+    total_rest_time=total_time-total_filtered_time 
+        #print(f"TOTAL recorded runtime {total_time/1e6} s")
+        #print(f"TOTAL time spent in cat {categories} and names {names} in total: {filtered_time/1e6} s")
+        #print(f"TOTAL time spent in the rest: {idle_time/1e6} s")
+    return total_time, filtered_times, rest_times, total_filtered_time,total_rest_time, df_result
+
+
+def total_time_breakdown(tracefile):
+    #tracefile=find_first_trace_file(dirpath)
+    df = trace_to_dataframe(tracefile)
+    df['end_time'] = df['ts']+df['dur']
+
+    # coarse grained, forward, backward, dataloader (PyTorch Annotations)
+    allowed_names=[["DDPGroupStrategy.training_step"], ["DDPGroupStrategy.backward"], ["train_dataloader_next"]]
+    ttotal, tselected_l, tidl_l, tselected, tidle, df_list_batches_unnamed = get_runtime_breakdown(df, names_list=allowed_names)
+    console.print(f"TOTAL TIME REC (recorded): {ttotal/1e6:.2f} sec")
+    data = {
+    "Sections": ["Forward", "Backward", "Data Loader"],
+    "Total Time in sec": np.array(tselected_l)/1e6,
+    "Relative to Total Rec Time": [f"{100*float(x)/ttotal:.2f}%" for x in tselected_l],
+    }
+
+    df_1 = pd.DataFrame(data)
+    #df_1.iloc[:, -1]=df_1.iloc[:, -1].astype('object')
+    #df_1.iloc[:, -1] = df_1.iloc[:, -1].map(lambda x: f"{float(x):.1f}%")
+    #data["Time relativ to recording time"] = data["Time relativ to recording time"]
+
+    console.print(df_1.to_string(index=False))
+    console.print(f"Time spent in the rest (with considering overlapp): {tidle/1e6:.2f} sec {100*tidle/ttotal:.2f}% of total rec time")
+    #todo (Marieke): add plot_pie if enabled
+
+    # encoder, processor, decoder timing breakdown
+    allowed_names=[["model.encoder"], ["model.processor"], ["model.decoder"]]
+    ttotal, tselected_l, tidl_l, tselected, tidle, df_list_batches_unnamed = get_runtime_breakdown(df, names_list=allowed_names)
+    #console.print(f"TOTAL TIME (recorded): {ttotal/1e6:.2f} sec")
+    data = {
+    "Sections": ["Encoder", "Processor", "Decoder"],
+    "Total Time in sec": np.array(tselected_l)/1e6,
+    "Relative to Total Rec Time": [f"{100*float(x)/ttotal:.2f}%" for x in tselected_l],
+    }
+
+    df_1 = pd.DataFrame(data)
+   # df_1.iloc[:, -1]=df_1.iloc[:, -1].astype('object')
+   # df_1.iloc[:, -1] = df_1.iloc[:, -1].map(lambda x: f"{x:.1f}%")
+    console.print(df_1.to_string(index=False))
+    console.print(f"Time spent in the rest (with considering overlapp): {tidle/1e6:.2f} sec {100*tidle/ttotal:.2f}% of total rec time")
+    console.print(f"Attention: not everything of the decoder, encoder and processor is recorded in the code yet!")
+    #todo (Marieke): add plot_pie if enabled
+    return df
+
+#def get_detailed_breakdown(df: pd.DataFrame, section="decoder"):
+
+# -----------------------------------------------------------------------------------------------------------------------
 def find_first_trace_file(dirpath: str) -> str | None:
     """
     Search the given directory (non-recursively) for the first file ending with '.pt.trace.json'.
@@ -381,6 +572,7 @@ def analyse_trace(dirpath):
     analyse_HtoD_memcpy(batch_sizes_GB, batch_transfer_bw_GBs, batch_transfer_durations_us)
     console.print("\n")
     analyse_gpu_memory_usage()
+    total_time_breakdown(filename)
 
 if __name__ == '__main__':
     #filename="/ec/res4/scratch/naco/aifs/outputs/raps/train/4N_16gpn_transformer_512c_o1280.jobname-619791/train-outputs/profiler/e5c4bd0471a2494f9183bdf493fafc7a/ac6-306.bullx_621045.None.1743008762865142923.pt.trace.json" # old o2560 512c with multi gpu
