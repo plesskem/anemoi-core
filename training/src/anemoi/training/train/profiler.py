@@ -20,7 +20,6 @@ import hydra
 import pandas as pd
 import pytorch_lightning as pl
 from omegaconf import DictConfig
-from pytorch_lightning.loggers.logger import Logger
 from pytorch_lightning.utilities import rank_zero_only
 from rich.console import Console
 
@@ -37,10 +36,20 @@ console = Console(record=True, width=200)
 class AnemoiProfiler(AnemoiTrainer):
     """Profiling for Anemoi."""
 
-    def __init__(self, config: DictConfig) -> None:
-        super().__init__(config)
-
     def print_report(self, title: str, dataframe: pd.DataFrame, color: str = "white", emoji: str = "") -> None:
+        """Print a formatted profiling report section to the Rich console.
+
+        Parameters
+        ----------
+        title : str
+            Section title.
+        dataframe : pd.DataFrame
+            Data to display.
+        color : str
+            Rich markup colour for the title.
+        emoji : str
+            Emoji name shown next to the title.
+        """
         if title == "Model Summary":
             console.print(f"[bold {color}]{title}[/bold {color}]", f":{emoji}:")
             console.print(dataframe, end="\n\n")
@@ -50,10 +59,12 @@ class AnemoiProfiler(AnemoiTrainer):
 
     @staticmethod
     def print_title() -> None:
+        """Print the benchmark profiler summary banner."""
         console.print("[bold magenta] Benchmark Profiler Summary [/bold magenta]!", ":book:")
 
     @staticmethod
     def print_metadata() -> None:
+        """Print SLURM and timestamp metadata."""
         console.print(f"[bold blue] SLURM NODE(s) {os.getenv('SLURM_JOB_NODELIST', '')} [/bold blue]!")
         console.print(f"[bold blue] SLURM JOB ID {os.getenv('SLURM_JOB_ID', '')} [/bold blue]!")
         console.print(f"[bold blue] TIMESTAMP {datetime.now(timezone.utc).strftime('%d/%m/%Y %H:%M:%S')} [/bold blue]!")
@@ -67,6 +78,7 @@ class AnemoiProfiler(AnemoiTrainer):
         system_metrics_df: pd.DataFrame | None = None,
         model_summary: str | None = None,
     ) -> None:
+        """Print all profiling report sections to the console."""
         self.print_title()
         self.print_metadata()
 
@@ -99,10 +111,12 @@ class AnemoiProfiler(AnemoiTrainer):
 
     @staticmethod
     def write_benchmark_profiler_report() -> None:
+        """Save the current console output to an HTML report file."""
         console.save_html("report.html")
 
     @staticmethod
     def to_df(sample_dict: dict[str, float], precision: str = ".5") -> pd.DataFrame:
+        """Convert a dict of metrics to a formatted DataFrame."""
         df = pd.DataFrame(sample_dict.items())
         df.columns = ["metric", "value"]
         df.value = df.value.apply(lambda x: f"%{precision}f" % x)
@@ -110,7 +124,7 @@ class AnemoiProfiler(AnemoiTrainer):
 
     @cached_property
     @rank_zero_only
-    def speed_profile(self) -> None:
+    def speed_profile(self) -> pd.DataFrame | None:
         """Speed profiler Report.
 
         Get speed metrics from Progress Bar for training and validation.
@@ -120,13 +134,12 @@ class AnemoiProfiler(AnemoiTrainer):
             for callback in self.callbacks:
                 if isinstance(callback, ProfilerProgressBar):
                     return self.profiler.get_speed_profiler_df(callback)
-            else:
-                error_msg = "No ProfilerProgressBar callback found."
-                raise ValueError(error_msg)
-        else:
-            return None
+            error_msg = "No ProfilerProgressBar callback found."
+            raise ValueError(error_msg)
+        return None
 
-    def _get_logger(self) -> dict[str, Logger]:
+    def _get_logger(self) -> dict | None:
+        """Return logger info dict for the enabled experiment logger, or None."""
         if (self.config.diagnostics.log.wandb.enabled) and (not self.config.diagnostics.log.wandb.offline):
             logger_info = {"logger_name": "wandb", "logger": self.wandb_logger}
         elif self.config.diagnostics.log.tensorboard.enabled:
@@ -140,7 +153,7 @@ class AnemoiProfiler(AnemoiTrainer):
 
     @cached_property
     @rank_zero_only
-    def system_profile(self) -> None:
+    def system_profile(self) -> pd.DataFrame | None:
         """System Profiler Report."""
         if self.config.diagnostics.benchmark_profiler.system.enabled:
             logger_info = self._get_logger()
@@ -155,7 +168,7 @@ class AnemoiProfiler(AnemoiTrainer):
 
     @cached_property
     @rank_zero_only
-    def memory_profile(self) -> None:
+    def memory_profile(self) -> pd.DataFrame | None:
         """Memory Profiler Report."""
         if self.config.diagnostics.benchmark_profiler.memory.enabled:
             return self.profiler.get_memory_profiler_df()
@@ -163,14 +176,15 @@ class AnemoiProfiler(AnemoiTrainer):
 
     @cached_property
     @rank_zero_only
-    def time_profile(self) -> None:
+    def time_profile(self) -> pd.DataFrame | None:
         """Time Profiler Report."""
         if self.config.diagnostics.benchmark_profiler.time.enabled:
             return self.profiler.get_time_profiler_df()
         return None
 
     @cached_property
-    def model_summary(self) -> str:
+    def model_summary(self) -> str | None:
+        """Generate model summary string if enabled in config."""
         if self.config.diagnostics.benchmark_profiler.model_summary.enabled:
             model = self.model
             return self.profiler.get_model_summary(model=model, example_input_array=self.example_input_array)
@@ -178,13 +192,14 @@ class AnemoiProfiler(AnemoiTrainer):
 
     @rank_zero_only
     def export_to_logger(self) -> None:
+        """Export profiling reports to the configured experiment logger."""
         if (self.config.diagnostics.log.wandb.enabled) and (not self.config.diagnostics.log.wandb.offline):
             self.to_wandb()
 
         elif self.config.diagnostics.log.mlflow.enabled:
             self.to_mlflow()
 
-    def report(self) -> str:
+    def report(self) -> None:
         """Print report to console."""
         LOGGER.info("Generating Profiler reports")
         self.print_benchmark_profiler_report(
@@ -195,14 +210,15 @@ class AnemoiProfiler(AnemoiTrainer):
             model_summary=self.model_summary,
         )
 
-    def _get_extra_files(self) -> None:
-        extra_files = []
-        extra_files.extend(self.profiler.dirpath.glob("*.pickle"))
+    def _get_extra_files(self) -> list:
+        """Collect extra artifact files from the profiler directory."""
+        extra_files = list(self.profiler.dirpath.glob("*.pickle"))
         # These trace files are too big to push to MLFlow so
-        # we won't push them as artifacts extra_files.extend(self.profiler.dirpath.glob("*.json"))
+        # we won't push them as artifacts
         return extra_files
 
     def _log_reports_to_mlflow(self, run_id: str, data: pd.DataFrame, artifact_file: str, report_fname: str) -> None:
+        """Log a profiling report table and artifact to MLFlow."""
         self.mlflow_logger.experiment.log_table(
             run_id=run_id,
             data=data,
@@ -216,10 +232,9 @@ class AnemoiProfiler(AnemoiTrainer):
         """Log report into MLFlow."""
         LOGGER.info("logging to MLFlow Profiler report")
         self.write_benchmark_profiler_report()
-        # check this https://stackoverflow.com/questions/71151054/how-to-log- d da-table-of-metrics-into-mlflow
 
         run_id = self.mlflow_logger.run_id
-        if self.config.diagnostics.benchmark_profiler.system.enabled:
+        if self.config.diagnostics.benchmark_profiler.system.enabled and self.system_profile is not None:
             self._log_reports_to_mlflow(
                 run_id=run_id,
                 data=self.system_profile,
@@ -227,7 +242,7 @@ class AnemoiProfiler(AnemoiTrainer):
                 report_fname=self.profiler.system_report_fname,
             )
 
-        if self.config.diagnostics.benchmark_profiler.time.enabled:
+        if self.config.diagnostics.benchmark_profiler.time.enabled and self.time_profile is not None:
             self._log_reports_to_mlflow(
                 run_id=run_id,
                 data=self.time_profile,
@@ -235,7 +250,7 @@ class AnemoiProfiler(AnemoiTrainer):
                 report_fname=self.profiler.time_report_fname,
             )
 
-        if self.config.diagnostics.benchmark_profiler.speed.enabled:
+        if self.config.diagnostics.benchmark_profiler.speed.enabled and self.speed_profile is not None:
             self._log_reports_to_mlflow(
                 run_id=run_id,
                 data=self.speed_profile,
@@ -243,7 +258,7 @@ class AnemoiProfiler(AnemoiTrainer):
                 report_fname=self.profiler.speed_report_fname,
             )
 
-        if self.config.diagnostics.benchmark_profiler.memory.enabled:
+        if self.config.diagnostics.benchmark_profiler.memory.enabled and self.memory_profile is not None:
             self._log_reports_to_mlflow(
                 run_id=run_id,
                 data=self.memory_profile,
@@ -252,41 +267,42 @@ class AnemoiProfiler(AnemoiTrainer):
             )
 
             extra_files = self._get_extra_files()
-            for file in extra_files:
-                artifact_path = self.profiler.dirpath / file
+            for artifact_path in extra_files:
                 if artifact_path.is_file():
                     self.mlflow_logger.experiment.log_artifact(run_id, artifact_path)
 
-        if self.config.diagnostics.benchmark_profiler.model_summary.enabled:
+        if self.config.diagnostics.benchmark_profiler.model_summary.enabled and self.model_summary is not None:
             self.mlflow_logger.experiment.log_artifact(run_id, self.profiler.model_summary_fname)
 
     @rank_zero_only
     def to_wandb(self) -> None:
-        """Log report into  W&B."""
+        """Log report into W&B."""
         LOGGER.info("logging to W&B Profiler report")
         self.write_benchmark_profiler_report()
         import wandb
-        from pytorch_lightning.loggers.wandb import WandbLogger
 
-        logger = WandbLogger(
-            project=self.run_dict["project"],
-            entity=self.run_dict["entity"],
-            id=self.run_dict["id"],
-            offline=self.config.diagnostics.log.wandb.offline,
-            resume=self.run_dict["id"],
-        )
+        logger = self.wandb_logger
 
-        logger.experiment.log({"speed_metrics_report": wandb.Table(dataframe=self.speed_profile)})
-        logger.experiment.log({"memory_metrics_report": wandb.Table(dataframe=self.system_profile)})
-        logger.experiment.log({"time_metrics_report": wandb.Table(dataframe=self.time_profile)})
-        logger.experiment.log({"memory_metrics_report": wandb.Table(dataframe=self.memory_profile)})
-        logger.experiment.log({"model_summary_report": wandb.Table(dataframe=self.model_summary)})
-        with Path("report.html").open("w") as f:
-            logger.experiment.log({"reports_benchmark_profiler": wandb.Html(f)})
-        logger.experiment.finish()
+        if self.speed_profile is not None:
+            logger.experiment.log({"speed_metrics_report": wandb.Table(dataframe=self.speed_profile)})
+        if self.system_profile is not None:
+            logger.experiment.log({"system_metrics_report": wandb.Table(dataframe=self.system_profile)})
+        if self.time_profile is not None:
+            logger.experiment.log({"time_metrics_report": wandb.Table(dataframe=self.time_profile)})
+        if self.memory_profile is not None:
+            logger.experiment.log({"memory_metrics_report": wandb.Table(dataframe=self.memory_profile)})
+        if self.model_summary is not None:
+            # model_summary is a string, not a DataFrame — log as HTML text
+            logger.experiment.log({"model_summary_report": wandb.Html(self.model_summary)})
+
+        report_path = Path("report.html")
+        if report_path.exists():
+            with report_path.open("r") as f:
+                logger.experiment.log({"reports_benchmark_profiler": wandb.Html(f)})
 
     @cached_property
     def callbacks(self) -> list[pl.callbacks.Callback]:
+        """Return trainer callbacks including the profiler progress bar."""
         callbacks = super().callbacks
         callbacks.append(ProfilerProgressBar())
         if self.config.diagnostics.benchmark_profiler.snapshot.enabled:
@@ -301,10 +317,11 @@ class AnemoiProfiler(AnemoiTrainer):
 
     @cached_property
     def datamodule(self) -> AnemoiDatasetsDataModule:
+        """Build the data module and capture an example input array."""
         datamodule = super().datamodule
         # to generate a model summary with shapes we need a sample input array
         batch = next(iter(datamodule.train_dataloader()))
-        if type(batch) in [list, tuple]:
+        if isinstance(batch, (list, tuple)):
             batch = batch[0]
         self.example_input_array = batch[
             :,
@@ -325,10 +342,11 @@ class AnemoiProfiler(AnemoiTrainer):
 
     @cached_property
     def profiler(self) -> BenchmarkProfiler:
+        """Instantiate the benchmark profiler."""
         return BenchmarkProfiler(self.config)
 
     def _update_paths(self) -> None:
-        """Update the paths in the configuration."""
+        """Update the profiler paths in the configuration."""
         super()._update_paths()
 
         if self.run_id:  # when using mlflow only rank0 will have a run_id except when resuming runs
@@ -341,6 +359,7 @@ class AnemoiProfiler(AnemoiTrainer):
         LOGGER.info("Profiler path: %s", self.config.hardware.paths.profiler)
 
     def _close_logger(self) -> None:
+        """Close the experiment logger to flush system metrics."""
         if (self.config.diagnostics.log.wandb.enabled) and (not self.config.diagnostics.log.wandb.offline):
             # We need to close the W&B logger to be able to read the System Metrics
             self.wandb_logger.experiment.finish()
@@ -348,6 +367,7 @@ class AnemoiProfiler(AnemoiTrainer):
     def profile(self) -> None:
         """Profile the model."""
         self.train()
+        self._close_logger()
         self.report()
         self.export_to_logger()
 
