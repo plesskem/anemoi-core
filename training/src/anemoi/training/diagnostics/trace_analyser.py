@@ -901,20 +901,23 @@ def analyse_trace(dirpath: Union[str, Path], device: int = 0) -> None:
     analyse_gpu_memory_usage(device=device)
 
     # Reuse the already-parsed DataFrame instead of re-reading JSON
+    console.print("\n")
     total_time_breakdown(df)
     console.print("\n")
-
+    console.print("===================== Runtime Breakdown =====================\n")
+    console.print("===================== ENCODER =====================\n")
     console.print("GPU RUNTIME BREAKDOWN: ENCODER")
     get_detailed_breakdown(df, section="model.encoder")
-    console.print("GPU RUNTIME BREAKDOWN: PROCESSOR")
-    get_detailed_breakdown(df, section="model.processor")
-    console.print("GPU RUNTIME BREAKDOWN: DECODER")
-    get_detailed_breakdown(df, section="model.decoder")
-
     console.print("CPU RUNTIME BREAKDOWN: ENCODER")
     get_detailed_breakdown(df, section="model.encoder", gpu=False)
+    console.print("===================== PROCESSOR =====================\n")
+    console.print("GPU RUNTIME BREAKDOWN: PROCESSOR")
+    get_detailed_breakdown(df, section="model.processor")
     console.print("CPU RUNTIME BREAKDOWN: PROCESSOR")
     get_detailed_breakdown(df, section="model.processor", gpu=False)
+    console.print("===================== DECODER =====================\n")
+    console.print("GPU RUNTIME BREAKDOWN: DECODER")
+    get_detailed_breakdown(df, section="model.decoder")
     console.print("CPU RUNTIME BREAKDOWN: DECODER")
     get_detailed_breakdown(df, section="model.decoder", gpu=False)
 
