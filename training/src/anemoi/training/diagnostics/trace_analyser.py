@@ -310,7 +310,7 @@ def total_time_breakdown(tracefile_or_df: Union[str, pd.DataFrame]) -> pd.DataFr
     if ttotal > 0:
         data = {
             "Sections": ["Forward", "Backward", "Data Loader"],
-            "Total Time in sec": np.array(tselected_l) / 1e6,
+            "Total Time in sec": np.round(np.array(tselected_l) / 1e6, 3),
             "Relative to Total Rec Time": [f"{100 * float(x) / ttotal:.2f}%" for x in tselected_l],
         }
         df_1 = pd.DataFrame(data)
@@ -328,7 +328,7 @@ def total_time_breakdown(tracefile_or_df: Union[str, pd.DataFrame]) -> pd.DataFr
     if ttotal > 0:
         data = {
             "Sections": ["Encoder", "Processor", "Decoder"],
-            "Total Time in sec": np.array(tselected_l) / 1e6,
+            "Total Time in sec": np.round(np.array(tselected_l) / 1e6, 3),
             "Relative to Total Rec Time": [f"{100 * float(x) / ttotal:.2f}%" for x in tselected_l],
         }
         df_1 = pd.DataFrame(data)
@@ -394,25 +394,30 @@ def get_detailed_breakdown(df: pd.DataFrame, section: str = "model.decoder", gpu
     ttime_exc_overlap_p = 100 * ttime_exc_overlap / total_wall_time if total_wall_time > 0 else 0.0
 
     df_annotations["total time (overlap considered) sec"] = df_annotations["total time (overlap considered) us"] / 1e6
-    df_annotations["user annotated method"] = df_annotations["name"].apply(trim_chain)
-    console.print(
-        df_annotations[
-            [
-                "user annotated method",
-                "total time (overlap considered) sec",
-                "ncalls",
-                "avg per call us",
-                "max per call us",
-                "min per call us",
-                "overlap %",
-            ]
+    df_annotations["user annotated method"] = df_annotations["name"]#.apply(trim_chain)
+    timing_cols = [
+        "total time (overlap considered) sec",
+        "avg per call us",
+        "max per call us",
+        "min per call us",
+        "overlap %",
+    ]
+    df_display = df_annotations[
+        [
+            "user annotated method",
+            "total time (overlap considered) sec",
+            "ncalls",
+            "avg per call us",
+            "max per call us",
+            "min per call us",
+            "overlap %",
         ]
-        .head(30)
-        .to_string(index=False)
-    )
+    ].head(10).copy()
+    df_display[timing_cols] = df_display[timing_cols].round(3)
+    console.print(df_display.to_string(index=False))
     label = "GPU" if gpu else "CPU"
-    console.print(f"TOTAL {label} TIME {ttime_exc_overlap / 1e6} sec {ttime_exc_overlap_p}% of total wall runtime\n")
-    console.print(f"TOTAL WALL TIME {total_wall_time / 1e6} sec \n")
+    console.print(f"TOTAL {label} TIME {ttime_exc_overlap / 1e6:.2f} sec {ttime_exc_overlap_p:.2f} % of total wall runtime\n")
+    console.print(f"TOTAL WALL TIME {total_wall_time / 1e6:.2f} sec \n")
     return df_annotations
 
 
@@ -905,6 +910,13 @@ def analyse_trace(dirpath: Union[str, Path], device: int = 0) -> None:
     get_detailed_breakdown(df, section="model.processor")
     console.print("GPU RUNTIME BREAKDOWN: DECODER")
     get_detailed_breakdown(df, section="model.decoder")
+
+    console.print("CPU RUNTIME BREAKDOWN: ENCODER")
+    get_detailed_breakdown(df, section="model.encoder", gpu=False)
+    console.print("CPU RUNTIME BREAKDOWN: PROCESSOR")
+    get_detailed_breakdown(df, section="model.processor", gpu=False)
+    console.print("CPU RUNTIME BREAKDOWN: DECODER")
+    get_detailed_breakdown(df, section="model.decoder", gpu=False)
 
 
 if __name__ == "__main__":
