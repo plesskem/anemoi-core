@@ -96,8 +96,8 @@ class AnemoiProfiler(AnemoiTrainer):
             self.print_report("Speed Profiling", speed_metrics_df, color="yellow", emoji="racing_car")
 
         if memory_metrics_df is not None:
-            warnings.warn("INFO: Memory Report metrics represent metrics aggregated across all nodes")
-            self.print_report("Memory Profiling", memory_metrics_df, color="purple", emoji="floppy_disk")
+            #warnings.warn("INFO: Memory Report metrics represent metrics aggregated across all nodes")
+            #self.print_report("Memory Profiling", memory_metrics_df, color="purple", emoji="floppy_disk")
             analyse_trace(self.profiler.dirpath)
 
         if system_metrics_df is not None:
