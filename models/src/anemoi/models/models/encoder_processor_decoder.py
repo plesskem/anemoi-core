@@ -28,7 +28,7 @@ from anemoi.models.distributed.graph import shard_tensor
 from anemoi.models.distributed.shapes import apply_shard_shapes
 from anemoi.models.distributed.shapes import get_shard_shapes
 from anemoi.models.layers.graph import NamedNodesAttributes
-from anemoi.models.layers.utils import load_layer_kernels, ProfilerWrapper
+from anemoi.models.layers.utils import load_layer_kernels#, ProfilerWrapper
 from anemoi.models.layers.mapper import GraphTransformerBaseMapper
 from anemoi.utils.config import DotDict
 
@@ -99,7 +99,7 @@ class AnemoiModelEncProcDec(nn.Module):
             src_grid_size=self.node_attributes.num_nodes[self._graph_name_data],
             dst_grid_size=self.node_attributes.num_nodes[self._graph_name_hidden],
         )
-        self.encoder = ProfilerWrapper(self.encoder, "encoder")
+        #self.encoder = ProfilerWrapper(self.encoder, "encoder")
 
         # Processor hidden -> hidden
         self.processor = instantiate(
@@ -110,7 +110,7 @@ class AnemoiModelEncProcDec(nn.Module):
             src_grid_size=self.node_attributes.num_nodes[self._graph_name_hidden],
             dst_grid_size=self.node_attributes.num_nodes[self._graph_name_hidden],
         )
-        self.processor = ProfilerWrapper(self.processor, "processor")
+        #self.processor = ProfilerWrapper(self.processor, "processor")
 
         # Decoder hidden -> data
         self.decoder = instantiate(
@@ -124,7 +124,7 @@ class AnemoiModelEncProcDec(nn.Module):
             src_grid_size=self.node_attributes.num_nodes[self._graph_name_hidden],
             dst_grid_size=self.node_attributes.num_nodes[self._graph_name_data],
         )
-        self.decoder = ProfilerWrapper(self.decoder, "decoder")
+        #self.decoder = ProfilerWrapper(self.decoder, "decoder")
 
         # Instantiation of model output bounding functions (e.g., to ensure outputs like TP are positive definite)
         self.boundings = nn.ModuleList(
