@@ -16,7 +16,8 @@ from typing import Optional, Union
 import numpy as np
 import pandas as pd
 from rich.console import Console
-
+from rich.table import Table
+from rich import box
 LOGGER = logging.getLogger(__name__)
 console = Console(record=True, width=200)
 
@@ -255,7 +256,7 @@ def runtime_analysis(
         results.append(
             {
                 name_col: name,
-                "total time (overlap considered) us": total_runtime,
+                "total time us": total_runtime,
                 "ncalls": ncalls,
                 "avg per call us": avgtime,
                 "max per call us": maxtime,
@@ -280,16 +281,80 @@ def trim_chain(s: str) -> str:
     prefix = parts[0].split("-")
     new_prefix = prefix[0] + "-" + prefix[1] if len(prefix) > 1 else prefix[0]
     return "...".join([new_prefix, new_suffix])
+def _plot_time_breakdowns(
+    fwd_bwd_data: Optional[tuple],
+    enc_dec_data: Optional[tuple],
+    nbatches: int,
+    ttotal_recorded: float,
+) -> None:
+    """Plot pie charts for the time breakdowns computed by total_time_breakdown."""
+    import matplotlib.pyplot as plt
+
+    charts = [d for d in [fwd_bwd_data, enc_dec_data] if d is not None]
+    titles = ["Forward · Backward · Data Loader", "Encoder · Processor · Decoder"]
+    titles = titles[-len(charts):]
+
+    colors_1 = ["#2196F3", "#FF5722", "#4CAF50", "#BDBDBD"]  # blue, deep-orange, green, grey
+    colors_2 = ["#9C27B0", "#F06292", "#FFD54F", "#BDBDBD"]  # purple, pink, amber, grey
+    color_sets = [colors_1, colors_2]
+
+    fig, axes = plt.subplots(1, len(charts), figsize=(7 * len(charts), 6))
+    if len(charts) == 1:
+        axes = [axes]
+
+    fig.patch.set_facecolor("white")
+
+    throughput = nbatches / (ttotal_recorded / 1e6) if ttotal_recorded > 0 else 0
+    fig.suptitle(
+        f"Time Breakdown — {nbatches} batches  |  "
+        f"Total: {ttotal_recorded / 1e6:.3f} s  |  "
+        f"Throughput: {throughput:.3f} it/s",
+        color="#212121", fontsize=13, fontweight="bold", y=1.02,
+    )
+
+    for ax, (labels, values), title, colors in zip(axes, charts, titles, color_sets):
+        filtered = [(l, v, c) for l, v, c in zip(labels, values, colors) if v > 0]
+        f_labels, f_values, f_colors = zip(*filtered) if filtered else ([], [], [])
+
+        wedges, texts, autotexts = ax.pie(
+            f_values,
+            labels=None,
+            autopct=lambda p: f"{p:.1f}%" if p > 2 else "",
+            colors=f_colors,
+            startangle=90,
+            pctdistance=0.75,
+            wedgeprops={"linewidth": 2, "edgecolor": "white"},
+        )
+        for at in autotexts:
+            at.set_fontsize(10)
+            at.set_color("#212121")
+            at.set_fontweight("bold")
+
+        ax.legend(
+            wedges,
+            [f"{l}  {v/1e6:.3f}s" for l, v in zip(f_labels, f_values)],
+            loc="lower center",
+            bbox_to_anchor=(0.5, -0.18),
+            ncol=2,
+            frameon=False,
+            labelcolor="#212121",
+            fontsize=10,
+        )
+        ax.set_title(title, color="#212121", fontsize=13, fontweight="bold", pad=16)
+        ax.set_facecolor("white")
+
+    plt.tight_layout()
+    plt.show()
 
 
-def total_time_breakdown(tracefile_or_df: Union[str, pd.DataFrame]) -> pd.DataFrame:
+def total_time_breakdown(tracefile_or_df: Union[str, pd.DataFrame], plot: bool = False) -> pd.DataFrame:
     """Print a coarse-grained time breakdown (forward, backward, dataloader, encoder, processor, decoder).
-
     Parameters
     ----------
     tracefile_or_df : str or pd.DataFrame
         Path to the trace JSON file, or an already-loaded trace DataFrame.
-
+    plot : bool, optional
+        If True, display pie charts for both breakdowns. Default is False.
     Returns
     -------
     pd.DataFrame
@@ -299,49 +364,64 @@ def total_time_breakdown(tracefile_or_df: Union[str, pd.DataFrame]) -> pd.DataFr
         df = tracefile_or_df
     else:
         df = trace_to_dataframe(tracefile_or_df)
-
     if "end_time" not in df.columns:
         df["end_time"] = df["ts"] + df["dur"]
 
-    # Forward, backward, dataloader breakdown
+    nbatches = len(df[df["name"].str.contains("run_training_batch", regex=True, na=False)])
+
+    console.print()
+    console.rule(f"TIME BREAKDOWN — {nbatches} recorded batches")
+
+    # ── Forward / Backward / Dataloader ───────────────────────────────────────
     allowed_names = [["DDPGroupStrategy.training_step"], ["DDPGroupStrategy.backward"], ["train_dataloader_next"]]
     ttotal, tselected_l, _tidl_l, _tselected, tidle, _df_list = get_runtime_breakdown(df, names_list=allowed_names)
-    console.print(f"TOTAL TIME REC (recorded): {ttotal / 1e6:.2f} sec")
-    if ttotal > 0:
-        data = {
-            "Sections": ["Forward", "Backward", "Data Loader"],
-            "Total Time in sec": np.round(np.array(tselected_l) / 1e6, 3),
-            "Relative to Total Rec Time": [f"{100 * float(x) / ttotal:.2f}%" for x in tselected_l],
-        }
-        df_1 = pd.DataFrame(data)
-        console.print(df_1.to_string(index=False))
-        console.print(
-            f"Time spent in the rest (considering overlap): {tidle / 1e6:.2f} sec "
-            f"{100 * tidle / ttotal:.2f}% of total rec time"
-        )
-    else:
-        console.print("Warning: total recorded time is zero, skipping forward/backward/dataloader breakdown")
+    ttotal_recorded = ttotal  # save before overwritten by encoder/decoder call
 
-    # Encoder, processor, decoder breakdown
+    throughput = nbatches / (ttotal / 1e6) if ttotal > 0 else 0
+    console.print(f"\n[bold]Total:[/bold] [yellow]{ttotal / 1e6:.2f} s[/yellow]  "
+                  f"[bold]Throughput:[/bold] [yellow]{throughput:.2f} it/s[/yellow]\n")
+
+    fwd_bwd_data = None
+    if ttotal > 0:
+        fwd_bwd_data = (["Forward", "Backward", "Data Loader", "Elsewhere"],
+                        [float(t) for t in tselected_l] + [float(tidle)])
+        table = Table(title="[bold]Forward · Backward · Data Loader[/bold]", title_justify="left",
+                      box=box.SIMPLE_HEAD, header_style="bold cyan", show_footer=True)
+        table.add_column("Section",      style="bold",    footer="[dim]Elsewhere[/dim]")
+        table.add_column("Duration (s)", justify="right", footer=f"[dim]{tidle / 1e6:.3f}[/dim]")
+        table.add_column("% of Total",   justify="right", footer=f"[dim]{100 * tidle / ttotal:.2f}%[/dim]")
+        for label, t in zip(["Forward", "Backward", "Data Loader"], tselected_l):
+            table.add_row(label, f"{float(t) / 1e6:.3f}", f"{100 * float(t) / ttotal:.2f}%")
+        console.print(table)
+    else:
+        console.print("[yellow]⚠  Total recorded time is zero — skipping forward/backward/dataloader breakdown.[/yellow]")
+
+    # ── Encoder / Processor / Decoder ─────────────────────────────────────────
     allowed_names = [["model.encoder"], ["model.processor"], ["model.decoder"]]
     ttotal, tselected_l, _tidl_l, _tselected, tidle, _df_list = get_runtime_breakdown(df, names_list=allowed_names)
-    if ttotal > 0:
-        data = {
-            "Sections": ["Encoder", "Processor", "Decoder"],
-            "Total Time in sec": np.round(np.array(tselected_l) / 1e6, 3),
-            "Relative to Total Rec Time": [f"{100 * float(x) / ttotal:.2f}%" for x in tselected_l],
-        }
-        df_1 = pd.DataFrame(data)
-        console.print(df_1.to_string(index=False))
-        console.print(
-            f"Time spent in the rest (considering overlap): {tidle / 1e6:.2f} sec "
-            f"{100 * tidle / ttotal:.2f}% of total rec time"
-        )
-    else:
-        console.print("Warning: total recorded time is zero, skipping encoder/processor/decoder breakdown")
-    console.print("Attention: not everything of the decoder, encoder and processor is recorded in the code yet!")
-    return df
 
+    enc_dec_data = None
+    if ttotal > 0:
+        enc_dec_data = (["Encoder", "Processor", "Decoder", "Elsewhere"],
+                        [float(t) for t in tselected_l] + [float(tidle)])
+        table2 = Table(title="[bold]Encoder · Processor · Decoder[/bold]", title_justify="left",
+                       box=box.SIMPLE_HEAD, header_style="bold cyan", show_footer=True)
+        table2.add_column("Section",      style="bold",    footer="[dim]Elsewhere[/dim]")
+        table2.add_column("Duration (s)", justify="right", footer=f"[dim]{tidle / 1e6:.3f}[/dim]")
+        table2.add_column("% of Total",   justify="right", footer=f"[dim]{100 * tidle / ttotal:.2f}%[/dim]")
+        for label, t in zip(["Encoder", "Processor", "Decoder"], tselected_l):
+            table2.add_row(label, f"{float(t) / 1e6:.3f}", f"{100 * float(t) / ttotal:.2f}%")
+        console.print(table2)
+    else:
+        console.print("[yellow]⚠  Total recorded time is zero — skipping encoder/processor/decoder breakdown.[/yellow]")
+
+    console.print("[dim]ℹ  Note: not all decoder/encoder/processor sections are instrumented yet.[/dim]")
+    console.print()
+
+    if plot and (fwd_bwd_data is not None or enc_dec_data is not None):
+        _plot_time_breakdowns(fwd_bwd_data, enc_dec_data, nbatches, ttotal_recorded)
+
+    return df
 
 def get_detailed_breakdown(df: pd.DataFrame, section: str = "model.decoder", gpu: bool = True) -> pd.DataFrame:
     """Compute a detailed runtime breakdown for a given model section.
@@ -360,10 +440,10 @@ def get_detailed_breakdown(df: pd.DataFrame, section: str = "model.decoder", gpu
     pd.DataFrame
         Per-method runtime statistics for the section.
     """
+
     if "end_time" not in df.columns:
         df = df.copy()
         df["end_time"] = df["ts"] + df["dur"]
-
     df_annotations = df[df["name"].str.contains(section, regex=True, na=False)].sort_values(by="ts")
 
     if df_annotations.empty:
@@ -389,14 +469,14 @@ def get_detailed_breakdown(df: pd.DataFrame, section: str = "model.decoder", gpu
     ttime_exc_overlap = df_annotations_merged["batch_dur"].sum()
 
     df_annotations = runtime_analysis(df_annotations).sort_values(
-        ["total time (overlap considered) us", "name"], ascending=[False, True]
+        ["total time us", "name"], ascending=[False, True]
     )
     ttime_exc_overlap_p = 100 * ttime_exc_overlap / total_wall_time if total_wall_time > 0 else 0.0
 
-    df_annotations["total time (overlap considered) sec"] = df_annotations["total time (overlap considered) us"] / 1e6
+    df_annotations["total time sec"] = df_annotations["total time us"] / 1e6
     df_annotations["user annotated method"] = df_annotations["name"]#.apply(trim_chain)
     timing_cols = [
-        "total time (overlap considered) sec",
+        "total time sec",
         "avg per call us",
         "max per call us",
         "min per call us",
@@ -405,7 +485,7 @@ def get_detailed_breakdown(df: pd.DataFrame, section: str = "model.decoder", gpu
     df_display = df_annotations[
         [
             "user annotated method",
-            "total time (overlap considered) sec",
+            "total time sec",
             "ncalls",
             "avg per call us",
             "max per call us",
