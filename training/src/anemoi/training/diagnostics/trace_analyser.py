@@ -18,6 +18,9 @@ import pandas as pd
 from rich.console import Console
 from rich.table import Table
 from rich import box
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+from matplotlib.patches import FancyArrowPatch
 LOGGER = logging.getLogger(__name__)
 console = Console(record=True, width=200)
 
@@ -281,70 +284,278 @@ def trim_chain(s: str) -> str:
     prefix = parts[0].split("-")
     new_prefix = prefix[0] + "-" + prefix[1] if len(prefix) > 1 else prefix[0]
     return "...".join([new_prefix, new_suffix])
+
+
+def _build_breakdown_table(
+    df_display: pd.DataFrame,
+    title: str,
+    section: str,
+    ttime_exc_overlap: float,
+    ttime_exc_overlap_p: float,
+) -> Table:
+    """Build a Rich Table for a subset of the breakdown dataframe."""
+
+    def _trim_annotation_name(name: str) -> str:
+        """Shorten a PyTorch annotation name.
+
+        Input:  'anemoi-GraphTransformerConv-model.model.decoder.proc.conv.forward'
+        Output: 'GraphTransformerConv | proc.conv | fwd'
+        """
+        try:
+            _, class_name, full_path = name.split("-", 2)
+            
+            # Strip call direction from the end first
+            if full_path.endswith(".forward"):
+                call = "fwd"
+                full_path = full_path[: -len(".forward")]
+            elif full_path.endswith(".backward"):
+                call = "bwd"
+                full_path = full_path[: -len(".backward")]
+            else:
+                call = ""
+
+            # Build prefix from the full_path structure directly:
+            # full_path is always "model.model.{section}.{subpath}"
+            # e.g. "model.model.decoder.proc.conv" with section="model.decoder"
+            # The fixed outer wrapper is always "model.model." + section + "."
+            # But section may itself be "model.decoder" or just "decoder",
+            # so derive the prefix by just finding the section string in the path.
+            section_leaf = section.split(".")[-1]  # e.g. "decoder" from "model.decoder"
+            marker = f".{section_leaf}."
+            idx = full_path.find(marker)
+            if idx != -1:
+                subpath = full_path[idx + len(marker):]
+            else:
+                subpath = full_path
+
+            parts = [class_name]
+            if subpath:
+                parts.append(subpath)
+            if call:
+                parts.append(call)
+            out = " | ".join(parts)
+            return out
+
+        except ValueError:
+            return name
+        
+    timing_cols = ["total time sec", "avg per call us", "max per call us", "min per call us", "overlap %"]
+    df_display = df_display.copy()  # Avoid SettingWithCopyWarning: df_display may be a slice from .head() or boolean indexing
+    df_display[timing_cols] = df_display[timing_cols].round(3)
+    df_display["method"] = df_display["name"].apply(_trim_annotation_name)
+
+    table = Table(
+        title=f"[bold]{title}[/bold]",
+        title_justify="left",
+        box=box.SIMPLE_HEAD,
+        header_style="bold cyan",
+        show_footer=True,
+    )
+    table.add_column("Method",    style="bold",    footer="[dim]Total (excl. overlap)[/dim]")
+    table.add_column("Total (s)", justify="right", footer=f"[dim]{ttime_exc_overlap / 1e6:.3f}[/dim]")
+    table.add_column("# Calls",   justify="right", footer="")
+    table.add_column("Avg (µs)",  justify="right", footer="")
+    table.add_column("Max (µs)",  justify="right", footer="")
+    table.add_column("Min (µs)",  justify="right", footer="")
+    table.add_column("Overlap %", justify="right", footer=f"[dim]{ttime_exc_overlap_p:.2f}%[/dim]")
+
+    for _, row in df_display.iterrows():
+        table.add_row(
+            row["method"],
+            f"{row['total time sec']:.3f}",
+            str(int(row["ncalls"])),
+            f"{row['avg per call us']:.3f}",
+            f"{row['max per call us']:.3f}",
+            f"{row['min per call us']:.3f}",
+            f"{row['overlap %']:.3f}",
+        )
+    return table
+
+
 def _plot_time_breakdowns(
     fwd_bwd_data: Optional[tuple],
     enc_dec_data: Optional[tuple],
     nbatches: int,
     ttotal_recorded: float,
+    savepath: str = "",
 ) -> None:
-    """Plot pie charts for the time breakdowns computed by total_time_breakdown."""
-    import matplotlib.pyplot as plt
+    """
+    Plot publication-quality pie charts for time breakdowns.
 
+    Parameters
+    ----------
+    fwd_bwd_data : tuple or None
+        (labels, values) for the forward/backward/data-loader breakdown.
+    enc_dec_data : tuple or None
+        (labels, values) for the encoder/processor/decoder breakdown.
+    nbatches : int
+        Number of batches processed.
+    ttotal_recorded : float
+        Total recorded wall time in microseconds.
+    savepath : str
+        If non-empty, the figure is saved to this path (PNG/PDF/SVG inferred
+        from extension). DPI is 300 for raster formats.
+    """
+   
+    # ── Publication style overrides ────────────────────────────────────────
+    pub_rc = {
+        "font.family": "serif",
+        "font.serif": ["Times New Roman", "DejaVu Serif", "serif"],
+        "font.size": 9,
+        "axes.titlesize": 10,
+        "axes.labelsize": 9,
+        "xtick.labelsize": 8,
+        "ytick.labelsize": 8,
+        "figure.dpi": 150,
+        "savefig.dpi": 300,
+        "pdf.fonttype": 42,   # embeds fonts in PDF (required by many journals)
+        "ps.fonttype": 42,
+        "text.usetex": False, # set True if LaTeX is available
+    }
+
+    # ── Colorblind-safe, print-friendly palettes ───────────────────────────
+    # Based on Paul Tol's "muted" qualitative scheme — distinguishable in
+    # greyscale and by dichromats.
+    PALETTES = [
+        # chart 1: forward / backward / data-loader / other
+        ["#4878CF", "#D65F5F", "#6ACC65", "#B8B8B8"],
+        # chart 2: encoder / processor / decoder / other
+        ["#7B4173", "#A9B800", "#E49444", "#B8B8B8"],
+    ]
+    EDGE_COLOR = "white"
+    TEXT_COLOR = "#1A1A1A"
+
+    # ── Data assembly ──────────────────────────────────────────────────────
     charts = [d for d in [fwd_bwd_data, enc_dec_data] if d is not None]
-    titles = ["Forward · Backward · Data Loader", "Encoder · Processor · Decoder"]
-    titles = titles[-len(charts):]
+    if not charts:
+        return
 
-    colors_1 = ["#2196F3", "#FF5722", "#4CAF50", "#BDBDBD"]  # blue, deep-orange, green, grey
-    colors_2 = ["#9C27B0", "#F06292", "#FFD54F", "#BDBDBD"]  # purple, pink, amber, grey
-    color_sets = [colors_1, colors_2]
+    panel_labels = ["(a)", "(b)"]
+   # subtitles = [
+   #     "Forward · Backward · Data loader",
+   #     "Encoder · Processor · Decoder",
+   # ]
+   # subtitles = subtitles[-len(charts):]
+    panel_labels = panel_labels[-len(charts):]
 
-    fig, axes = plt.subplots(1, len(charts), figsize=(7 * len(charts), 6))
-    if len(charts) == 1:
-        axes = [axes]
+    # ── Layout ────────────────────────────────────────────────────────────
+    col_width_in = 3.3           # ~1 journal column each
+    fig_w = col_width_in * len(charts) + 0.4
+    fig_h = 3.8
 
-    fig.patch.set_facecolor("white")
-
-    throughput = nbatches / (ttotal_recorded / 1e6) if ttotal_recorded > 0 else 0
-    fig.suptitle(
-        f"Time Breakdown — {nbatches} batches  |  "
-        f"Total: {ttotal_recorded / 1e6:.3f} s  |  "
-        f"Throughput: {throughput:.3f} it/s",
-        color="#212121", fontsize=13, fontweight="bold", y=1.02,
-    )
-
-    for ax, (labels, values), title, colors in zip(axes, charts, titles, color_sets):
-        filtered = [(l, v, c) for l, v, c in zip(labels, values, colors) if v > 0]
-        f_labels, f_values, f_colors = zip(*filtered) if filtered else ([], [], [])
-
-        wedges, texts, autotexts = ax.pie(
-            f_values,
-            labels=None,
-            autopct=lambda p: f"{p:.1f}%" if p > 2 else "",
-            colors=f_colors,
-            startangle=90,
-            pctdistance=0.75,
-            wedgeprops={"linewidth": 2, "edgecolor": "white"},
+    with mpl.rc_context(pub_rc):
+        fig, axes = plt.subplots(
+            1, len(charts),
+            figsize=(fig_w, fig_h),
+            facecolor="white",
         )
-        for at in autotexts:
-            at.set_fontsize(10)
-            at.set_color("#212121")
-            at.set_fontweight("bold")
+        if len(charts) == 1:
+            axes = [axes]
 
-        ax.legend(
-            wedges,
-            [f"{l}  {v/1e6:.3f}s" for l, v in zip(f_labels, f_values)],
-            loc="lower center",
-            bbox_to_anchor=(0.5, -0.18),
-            ncol=2,
-            frameon=False,
-            labelcolor="#212121",
+        # ── Suptitle ──────────────────────────────────────────────────────
+        throughput = nbatches / (ttotal_recorded / 1e6) if ttotal_recorded > 0 else 0
+        total_s = ttotal_recorded / 1e6
+        fig.suptitle(
+            f"Batches: {nbatches}  ·  Total: {total_s:.3f} s  ·  Throughput: {throughput:.2f} it/s",
             fontsize=10,
+            fontweight="bold",
+            color=TEXT_COLOR,
+            y=1.01,
         )
-        ax.set_title(title, color="#212121", fontsize=13, fontweight="bold", pad=16)
-        ax.set_facecolor("white")
 
-    plt.tight_layout()
-    plt.show()
+        for idx, (ax, (labels, values), panel) in enumerate(
+            zip(axes, charts, panel_labels)
+        ):
+            colors = PALETTES[idx % len(PALETTES)]
+
+            # Filter zero-value slices
+            triples = [(l, v, c) for l, v, c in zip(labels, values, colors) if v > 0]
+            if not triples:
+                ax.set_visible(False)
+                continue
+            f_labels, f_values, f_colors = zip(*triples)
+            total_val = sum(f_values)
+
+            # ── Pie chart ─────────────────────────────────────────────────
+            explode = [0.025] * len(f_labels)
+            wedges, _, autotexts = ax.pie(
+                f_values,
+                labels=None,
+                autopct=lambda p: f"{p:.1f}%" if p >= 3 else "",
+                colors=f_colors,
+                startangle=90,
+                pctdistance=1.18,        # push text outside the wedge
+                explode=explode,
+                wedgeprops={
+                    "linewidth": 0.8,
+                    "edgecolor": EDGE_COLOR,
+                    "antialiased": True,
+                },
+                textprops={"fontsize": 7.5, "color": TEXT_COLOR},
+            )
+            for at in autotexts:
+                at.set_fontsize(7.5)
+                at.set_color(TEXT_COLOR)
+                at.set_fontweight("bold")
+
+            # ── Panel label (a), (b) top-left ─────────────────────────────
+            ax.text(
+                -1.35, 1.15, panel,
+                transform=ax.transData,
+                fontsize=9, fontweight="bold",
+                color=TEXT_COLOR, va="top",
+            )
+
+            # ── Subtitle below panel label ─────────────────────────────────
+           # ax.set_title(subtitle, fontsize=9, color=TEXT_COLOR, pad=8, loc="center")
+
+            # ── Legend: coloured square + label + time + % ─────────────────
+            legend_entries = [
+                rf"{l}  {v / 1e6:.3f} s"
+                if total_val > 0 else l
+                for l, v in zip(f_labels, f_values)
+            ]
+            leg = ax.legend(
+                wedges,
+                legend_entries,
+                loc="lower center",
+                bbox_to_anchor=(0.5, -0.34),
+                ncol=1,
+                frameon=True,
+                framealpha=0.0,
+                edgecolor="none",
+                labelcolor=TEXT_COLOR,
+                fontsize=7.5,
+                handlelength=1.2,
+                handleheight=1.0,
+                handletextpad=0.5,
+                borderpad=0.3,
+                labelspacing=0.35,
+            )
+            # Square handles instead of pie wedges
+            for handle in leg.legend_handles:
+                handle.set_linewidth(0)
+
+            ax.set_facecolor("white")
+
+        # ── Shared thin frame around the whole figure ──────────────────────
+        for spine in ["top", "right", "bottom", "left"]:
+            for ax in axes:
+                ax.spines[spine].set_visible(False)
+
+        plt.tight_layout(rect=[0, 0, 1, 0.97])
+
+        if savepath:
+            ext = savepath.rsplit(".", 1)[-1].lower()
+            dpi = 300 if ext in ("png", "tiff", "jpg", "jpeg") else None
+            fig.savefig(
+                savepath,
+                bbox_inches="tight",
+                dpi=dpi,
+                facecolor="white",
+            )
+
+        plt.show()
 
 
 def total_time_breakdown(tracefile_or_df: Union[str, pd.DataFrame], plot: bool = False) -> pd.DataFrame:
@@ -378,8 +589,10 @@ def total_time_breakdown(tracefile_or_df: Union[str, pd.DataFrame], plot: bool =
     ttotal_recorded = ttotal  # save before overwritten by encoder/decoder call
 
     throughput = nbatches / (ttotal / 1e6) if ttotal > 0 else 0
-    console.print(f"\n[bold]Total:[/bold] [yellow]{ttotal / 1e6:.2f} s[/yellow]  "
-                  f"[bold]Throughput:[/bold] [yellow]{throughput:.2f} it/s[/yellow]\n")
+    console.print(
+        f"\n[bold]Total:[/bold] [yellow]{ttotal / 1e6:.2f} s[/yellow]  "
+        f"[bold]Throughput:[/bold] [yellow]{throughput:.2f} it/s[/yellow]\n"
+    )
 
     fwd_bwd_data = None
     if ttotal > 0:
@@ -423,9 +636,9 @@ def total_time_breakdown(tracefile_or_df: Union[str, pd.DataFrame], plot: bool =
 
     return df
 
+
 def get_detailed_breakdown(df: pd.DataFrame, section: str = "model.decoder", gpu: bool = True) -> pd.DataFrame:
     """Compute a detailed runtime breakdown for a given model section.
-
     Parameters
     ----------
     df : pd.DataFrame
@@ -434,20 +647,18 @@ def get_detailed_breakdown(df: pd.DataFrame, section: str = "model.decoder", gpu
         Name pattern to filter annotations (e.g. "model.encoder").
     gpu : bool
         If True, filter for GPU annotations; otherwise CPU annotations.
-
     Returns
     -------
     pd.DataFrame
         Per-method runtime statistics for the section.
     """
-
     if "end_time" not in df.columns:
         df = df.copy()
         df["end_time"] = df["ts"] + df["dur"]
-    df_annotations = df[df["name"].str.contains(section, regex=True, na=False)].sort_values(by="ts")
 
+    df_annotations = df[df["name"].str.contains(section, regex=True, na=False)].sort_values(by="ts")
     if df_annotations.empty:
-        console.print(f"No annotations found for section '{section}'")
+        console.print(f"[yellow]⚠  No annotations found for section '{section}'[/yellow]")
         return pd.DataFrame()
 
     # Total wall time for the section
@@ -456,50 +667,327 @@ def get_detailed_breakdown(df: pd.DataFrame, section: str = "model.decoder", gpu
     total_wall_time = df_annotations_merged["batch_dur"].sum()
 
     # Filter for GPU or CPU annotations
+    label = "GPU" if gpu else "CPU"
     cat_filter = "gpu_user_annotation" if gpu else "user_annotation"
     df_annotations = df_annotations[df_annotations["cat"] == cat_filter].sort_values(by="ts")
-
     if df_annotations.empty:
-        console.print(f"No {'GPU' if gpu else 'CPU'} annotations found for section '{section}'")
+        console.print(f"[yellow]⚠  No {label} annotations found for section '{section}'[/yellow]")
         return pd.DataFrame()
 
     # Calculate total time excluding overlap between methods
     df_annotations_merged = merge_overlapping_intervals_df(df_annotations[["name", "ts", "end_time"]])
     df_annotations_merged["batch_dur"] = df_annotations_merged["end_time"] - df_annotations_merged["ts"]
     ttime_exc_overlap = df_annotations_merged["batch_dur"].sum()
+    ttime_exc_overlap_p = 100 * ttime_exc_overlap / total_wall_time if total_wall_time > 0 else 0.0
 
     df_annotations = runtime_analysis(df_annotations).sort_values(
         ["total time us", "name"], ascending=[False, True]
     )
-    ttime_exc_overlap_p = 100 * ttime_exc_overlap / total_wall_time if total_wall_time > 0 else 0.0
-
     df_annotations["total time sec"] = df_annotations["total time us"] / 1e6
-    df_annotations["user annotated method"] = df_annotations["name"]#.apply(trim_chain)
-    timing_cols = [
-        "total time sec",
-        "avg per call us",
-        "max per call us",
-        "min per call us",
-        "overlap %",
-    ]
-    df_display = df_annotations[
-        [
-            "user annotated method",
-            "total time sec",
-            "ncalls",
-            "avg per call us",
-            "max per call us",
-            "min per call us",
-            "overlap %",
-        ]
-    ].head(10).copy()
-    df_display[timing_cols] = df_display[timing_cols].round(3)
-    console.print(df_display.to_string(index=False))
-    label = "GPU" if gpu else "CPU"
-    console.print(f"TOTAL {label} TIME {ttime_exc_overlap / 1e6:.2f} sec {ttime_exc_overlap_p:.2f} % of total wall runtime\n")
-    console.print(f"TOTAL WALL TIME {total_wall_time / 1e6:.2f} sec \n")
+
+    console.print()
+    console.rule(f"DETAILED {label} BREAKDOWN — {section}")
+    console.print(
+        f"\n[bold]Total wall time:[/bold] [yellow]{total_wall_time / 1e6:.3f} s[/yellow]   "
+        f"[bold]Total {label} time (excl. overlap):[/bold] [yellow]{ttime_exc_overlap / 1e6:.3f} s[/yellow]  "
+        f"[yellow]{ttime_exc_overlap_p:.2f}%[/yellow] of wall time\n"
+    )
+
+    # ── Forward pass ──────────────────────────────────────────────────────────
+    df_fwd = df_annotations[df_annotations["name"].str.endswith(".forward")].head(10)
+    if not df_fwd.empty:
+        df_fwd_merged = merge_overlapping_intervals_df(
+            df[df["name"].isin(df_fwd["name"])][["name", "ts", "end_time"]]
+        )
+        df_fwd_merged["batch_dur"] = df_fwd_merged["end_time"] - df_fwd_merged["ts"]
+        ttime_fwd = df_fwd_merged["batch_dur"].sum()
+        ttime_fwd_p = 100 * ttime_fwd / total_wall_time if total_wall_time > 0 else 0.0
+        console.print(_build_breakdown_table(df_fwd, "Top 10 Forward Pass Contributors", section, ttime_fwd, ttime_fwd_p))
+    else:
+        console.print("[dim]No forward pass annotations found.[/dim]")
+
+    # ── Backward pass ─────────────────────────────────────────────────────────
+    df_bwd = df_annotations[df_annotations["name"].str.endswith(".backward")].head(10)
+    if not df_bwd.empty:
+        df_bwd_merged = merge_overlapping_intervals_df(
+            df[df["name"].isin(df_bwd["name"])][["name", "ts", "end_time"]]
+        )
+        df_bwd_merged["batch_dur"] = df_bwd_merged["end_time"] - df_bwd_merged["ts"]
+        ttime_bwd = df_bwd_merged["batch_dur"].sum()
+        ttime_bwd_p = 100 * ttime_bwd / total_wall_time if total_wall_time > 0 else 0.0
+        console.print(_build_breakdown_table(df_bwd, "Top 10 Backward Pass Contributors", section, ttime_bwd, ttime_bwd_p))
+    else:
+        console.print("[dim]No backward pass annotations found.[/dim]")
+
+    console.print()
     return df_annotations
 
+
+def _plot_gpu_time_breakdown(
+    labels: list[str],
+    times_us: list[float],
+    ttotal: float,
+    nbatches: int,
+    savepath: str = "",
+) -> None:
+    """Plot a publication-quality grouped bar chart for the GPU time breakdown.
+
+    Parameters
+    ----------
+    labels : list[str]
+        Section names (Computation, Communication, Memory Ops, Data Loader, GPU Idle).
+    times_us : list[float]
+        Duration per section in microseconds.
+    ttotal : float
+        Total recorded time in microseconds.
+    nbatches : int
+        Number of batches.
+    savepath : str
+        Optional path to save the figure.
+    """
+    pub_rc = {
+        "font.family": "serif",
+        "font.serif": ["Times New Roman", "DejaVu Serif", "serif"],
+        "font.size": 9,
+        "axes.titlesize": 10,
+        "axes.labelsize": 9,
+        "xtick.labelsize": 8,
+        "ytick.labelsize": 8,
+        "figure.dpi": 150,
+        "savefig.dpi": 300,
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+        "text.usetex": False,
+    }
+
+    # Colorblind-safe palette (Paul Tol muted + grey for idle)
+    COLORS = ["#4878CF", "#D65F5F", "#6ACC65", "#E49444", "#B8B8B8"]
+    TEXT_COLOR = "#1A1A1A"
+    EDGE_COLOR = "white"
+
+    values_s = [t / 1e6 for t in times_us]
+
+    with mpl.rc_context(pub_rc):
+        fig, ax = plt.subplots(figsize=(6, 3.8), facecolor="white")
+
+        throughput = nbatches / (ttotal / 1e6) if ttotal > 0 else 0
+        fig.suptitle(
+            f"Batches: {nbatches}  ·  Total: {ttotal / 1e6:.3f} s  ·  Throughput: {throughput:.2f} it/s",
+            fontsize=10,
+            fontweight="bold",
+            color=TEXT_COLOR,
+            y=1.02,
+        )
+
+        x = np.arange(len(labels))
+        colors = COLORS[: len(labels)]
+
+        bars = ax.bar(
+            x, values_s,
+            color=colors,
+            edgecolor=EDGE_COLOR,
+            linewidth=0.8,
+        )
+
+        # Percentage labels on each bar
+        max_val = max(values_s) if values_s else 1
+        for rect, val in zip(bars, values_s):
+            pct = 100 * val / (ttotal / 1e6) if ttotal > 0 else 0
+            ax.text(
+                rect.get_x() + rect.get_width() / 2,
+                rect.get_height() + 0.015 * max_val,
+                f"{pct:.1f}%",
+                ha="center", va="bottom",
+                fontsize=7.5, fontweight="bold", color=TEXT_COLOR,
+            )
+            # Duration below percentage
+            ax.text(
+                rect.get_x() + rect.get_width() / 2,
+                rect.get_height() + 0.07 * max_val,
+                f"{val:.3f} s",
+                ha="center", va="bottom",
+                fontsize=6.5, color=TEXT_COLOR,
+            )
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, fontsize=8, fontweight="bold")
+        ax.set_ylabel("Duration (s)")
+        ax.set_title(
+            "GPU Time Breakdown (sections may overlap)",
+            loc="left", fontsize=9, fontweight="bold",
+        )
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.set_facecolor("white")
+
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+
+        if savepath:
+            ext = savepath.rsplit(".", 1)[-1].lower()
+            dpi = 300 if ext in ("png", "tiff", "jpg", "jpeg") else None
+            fig.savefig(savepath, bbox_inches="tight", dpi=dpi, facecolor="white")
+
+        plt.show()
+
+def gpu_time_breakdown(
+    tracefile_or_df: Union[str, pd.DataFrame],
+    plot: bool = False,
+    savepath: str = "",
+) -> pd.DataFrame:
+    """Print a GPU-centric time breakdown (computation, communication, memory ops, data loader).
+
+    These categories overlap across GPU streams, so percentages may sum to
+    more than 100%.  An optional grouped bar chart is provided instead of
+    a pie chart.
+
+    Parameters
+    ----------
+    tracefile_or_df : str or pd.DataFrame
+        Path to the trace JSON file, or an already-loaded trace DataFrame.
+    plot : bool, optional
+        If True, display a grouped bar chart of the breakdown.
+    savepath : str, optional
+        If non-empty and *plot* is True, save the figure to this path.
+
+    Returns
+    -------
+    pd.DataFrame
+        Summary DataFrame with columns
+        ``['Section', 'Duration (s)', '% of Total', 'Intervals']``.
+    """
+    if isinstance(tracefile_or_df, pd.DataFrame):
+        df = tracefile_or_df
+    else:
+        df = trace_to_dataframe(tracefile_or_df)
+    if "end_time" not in df.columns:
+        df["end_time"] = df["ts"] + df["dur"]
+
+    start_time = df["ts"].min()
+    end_time_max = df["end_time"].max()
+    ttotal = end_time_max - start_time
+
+    nbatches = len(df[df["name"].str.contains("run_training_batch", regex=True, na=False)])
+
+    console.print()
+    console.rule(f"GPU TIME BREAKDOWN — {nbatches} recorded batches")
+
+    throughput = nbatches / (ttotal / 1e6) if ttotal > 0 else 0
+    console.print(
+        f"\n[bold]Total recorded time:[/bold] [yellow]{ttotal / 1e6:.3f} s[/yellow]  "
+        f"[bold]Throughput:[/bold] [yellow]{throughput:.2f} it/s[/yellow]\n"
+    )
+
+    # ── Section definitions ───────────────────────────────────────────────────
+    # (label, cat_patterns, name_patterns, name_excludes)
+    sections = [
+        ("Computation",   ["kernel"],                    [],                         ["nccl"]),
+        ("Communication", [],                            ["nccl"],                   []),
+        ("Memory Ops",    ["gpu_memcpy", "gpu_memset"],  [],                         []),
+        ("Data Loader",   [],                            ["train_dataloader_next"],  []),
+    ]
+
+    section_labels: list[str] = []
+    section_times: list[float] = []
+    section_intervals: list[int] = []
+    gpu_stream_dfs: list[pd.DataFrame] = []          # first 3 for GPU active
+
+    for label, cats, names, no_names in sections:
+        df_sec = df.copy()
+        if cats:
+            pat = "|".join(cats)
+            df_sec = df_sec[df_sec["cat"].str.contains(pat, regex=True, na=False)]
+        if names:
+            pat = "|".join(names)
+            df_sec = df_sec[df_sec["name"].str.contains(pat, regex=True, na=False)]
+        if no_names:
+            pat = "|".join(no_names)
+            df_sec = df_sec[~df_sec["name"].str.contains(pat, regex=True, na=False)]
+
+        df_sec = df_sec.sort_values(by="ts")
+        df_merged = merge_overlapping_intervals_df(df_sec[["ts", "end_time"]])
+        df_merged["batch_dur"] = df_merged["end_time"] - df_merged["ts"]
+        t = float(df_merged["batch_dur"].sum())
+
+        section_labels.append(label)
+        section_times.append(t)
+        section_intervals.append(len(df_merged))
+        gpu_stream_dfs.append(df_merged)
+
+    # ── Combined GPU activity (computation + communication + memory) ──────────
+    gpu_only = [gpu_stream_dfs[i] for i in range(3) if not gpu_stream_dfs[i].empty]
+    if gpu_only:
+        combined = pd.concat(gpu_only, ignore_index=True)
+        combined = merge_overlapping_intervals_df(combined[["ts", "end_time"]])
+        combined["batch_dur"] = combined["end_time"] - combined["ts"]
+        gpu_active_time = float(combined["batch_dur"].sum())
+    else:
+        gpu_active_time = 0.0
+
+    gpu_idle_time = float(ttotal) - gpu_active_time
+
+    # ── Rich table ────────────────────────────────────────────────────────────
+    table = Table(
+        title="[bold]GPU Time Breakdown (sections may overlap)[/bold]",
+        title_justify="left",
+        box=box.SIMPLE_HEAD,
+        header_style="bold cyan",
+        show_footer=True,
+    )
+    table.add_column("Section", style="bold", footer="[dim]GPU Active (merged)[/dim]")
+    table.add_column(
+        "Duration (s)", justify="right",
+        footer=f"[dim]{gpu_active_time / 1e6:.3f}[/dim]",
+    )
+    table.add_column(
+        "% of Total", justify="right",
+        footer=f"[dim]{100 * gpu_active_time / ttotal:.2f}%[/dim]" if ttotal > 0 else "[dim]—[/dim]",
+    )
+    table.add_column("Intervals", justify="right", footer="")
+
+    for label, t, n_int in zip(section_labels, section_times, section_intervals):
+        pct = f"{100 * t / ttotal:.2f}%" if ttotal > 0 else "—"
+        table.add_row(label, f"{t / 1e6:.3f}", pct, str(n_int))
+
+    console.print(table)
+
+    if ttotal > 0:
+        console.print(
+            f"[dim]GPU Idle (not on any GPU stream): {gpu_idle_time / 1e6:.3f} s "
+            f"({100 * gpu_idle_time / ttotal:.2f}%)[/dim]"
+        )
+    console.print("[dim]ℹ  Sections overlap across streams — percentages may sum to >100%.[/dim]")
+    console.print()
+
+    # ── Summary DataFrame ─────────────────────────────────────────────────────
+    summary_rows = []
+    for label, t, n_int in zip(section_labels, section_times, section_intervals):
+        summary_rows.append({
+            "Section": label,
+            "Duration (s)": t / 1e6,
+            "% of Total": 100 * t / ttotal if ttotal > 0 else 0.0,
+            "Intervals": n_int,
+        })
+    summary_rows.append({
+        "Section": "GPU Active (merged)",
+        "Duration (s)": gpu_active_time / 1e6,
+        "% of Total": 100 * gpu_active_time / ttotal if ttotal > 0 else 0.0,
+        "Intervals": 0,
+    })
+    summary_rows.append({
+        "Section": "GPU Idle",
+        "Duration (s)": gpu_idle_time / 1e6,
+        "% of Total": 100 * gpu_idle_time / ttotal if ttotal > 0 else 0.0,
+        "Intervals": 0,
+    })
+    summary_df = pd.DataFrame(summary_rows)
+
+    # ── Optional plot ─────────────────────────────────────────────────────────
+    if plot and ttotal > 0:
+        all_labels = section_labels + ["GPU Idle"]
+        all_times = section_times + [gpu_idle_time]
+        _plot_gpu_time_breakdown(all_labels, all_times, ttotal, nbatches, savepath=savepath)
+
+    return summary_df
 
 def find_first_trace_file(dirpath: Union[str, Path]) -> Optional[str]:
     """Find the first ``*.pt.trace.json`` file in a directory.
@@ -956,49 +1444,41 @@ def analyse_trace(dirpath: Union[str, Path], device: int = 0) -> None:
         return
 
     console.print(f"Analysing {filename}")
-    (
-        batch_sizes_GB,
-        batch_transfer_bw_GBs,
-        batch_transfer_durations_us,
-        dataloading_stall_durations_us,
-        iteration_durations_us,
-        kernel_durations,
-        kernel_counts,
-        kernel_weighted_occupancies,
-        iteration_count,
-        df,
-    ) = parse_json_trace_file(filename)
+   # (
+        #batch_sizes_GB,
+        #batch_transfer_bw_GBs,
+        #batch_transfer_durations_us,
+        #dataloading_stall_durations_us,
+        #iteration_durations_us,
+        #kernel_durations,
+        #kernel_counts,
+        #kernel_weighted_occupancies,
+        #iteration_count,
+        #df,
+    #) = parse_json_trace_file(filename)
 
-    kernel_durations_sorted = sum_kernel_durations(kernel_durations)
-    print_kernel_table(
-        kernel_durations_sorted, kernel_counts, kernel_weighted_occupancies, top_n=10, num_iterations=iteration_count
-    )
-    console.print("\n")
-    compute_av_time_per_iter_and_dl_stalls(iteration_durations_us, dataloading_stall_durations_us)
-    console.print("\n")
-    analyse_HtoD_memcpy(batch_sizes_GB, batch_transfer_bw_GBs, batch_transfer_durations_us)
-    console.print("\n")
-    analyse_gpu_memory_usage(device=device)
+    #kernel_durations_sorted = sum_kernel_durations(kernel_durations)
+    #print_kernel_table(
+        #kernel_durations_sorted, kernel_counts, kernel_weighted_occupancies, top_n=10, num_iterations=iteration_count
+    #)
+    #console.print("\n")
+    #compute_av_time_per_iter_and_dl_stalls(iteration_durations_us, dataloading_stall_durations_us)
+    #console.print("\n")
+    #analyse_HtoD_memcpy(batch_sizes_GB, batch_transfer_bw_GBs, batch_transfer_durations_us)
+    #console.print("\n")
+    #analyse_gpu_memory_usage(device=device)
 
-    # Reuse the already-parsed DataFrame instead of re-reading JSON
+    df = trace_to_dataframe(filename)
     console.print("\n")
     total_time_breakdown(df)
     console.print("\n")
-    console.print("===================== Runtime Breakdown =====================\n")
-    console.print("===================== ENCODER =====================\n")
-    console.print("GPU RUNTIME BREAKDOWN: ENCODER")
+    gpu_time_breakdown(df)
+    console.print("\n")
     get_detailed_breakdown(df, section="model.encoder")
-    console.print("CPU RUNTIME BREAKDOWN: ENCODER")
     get_detailed_breakdown(df, section="model.encoder", gpu=False)
-    console.print("===================== PROCESSOR =====================\n")
-    console.print("GPU RUNTIME BREAKDOWN: PROCESSOR")
     get_detailed_breakdown(df, section="model.processor")
-    console.print("CPU RUNTIME BREAKDOWN: PROCESSOR")
     get_detailed_breakdown(df, section="model.processor", gpu=False)
-    console.print("===================== DECODER =====================\n")
-    console.print("GPU RUNTIME BREAKDOWN: DECODER")
     get_detailed_breakdown(df, section="model.decoder")
-    console.print("CPU RUNTIME BREAKDOWN: DECODER")
     get_detailed_breakdown(df, section="model.decoder", gpu=False)
 
 
