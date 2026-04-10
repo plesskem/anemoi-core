@@ -143,7 +143,6 @@ def trace_to_dataframe(trace_file: str, cols: Optional[list[str]] = None) -> pd.
 
     return df
 
-
 def merge_overlapping_intervals_df(
     df: pd.DataFrame,
     start_col: str = "ts",
@@ -628,9 +627,8 @@ def print_trace_metadata(df: pd.DataFrame) -> None:
 
     if isinstance(distributed_info, dict):
         rank = distributed_info.get("rank", "-")
-        world_size = distributed_info.get("world_size", "-")
         backend = distributed_info.get("backend", "-")
-        table.add_row("Distributed", f"rank {rank}/{world_size}, backend={backend}")
+        table.add_row("Distributed", f"rank {rank}, backend={backend}")
     else:
         table.add_row("Distributed", "-")
 
@@ -1251,10 +1249,10 @@ def _print_multi_rank_overview(rows: list[dict]) -> None:
     console.print(table)
 
     metric_specs = [
-        ("Throughput (it/s)", "throughput", "higher"),
-        ("GPU idle (%)", "gpu_idle_pct", "lower"),
-        ("Comm (%)", "comm_pct", "lower"),
-        ("Total (s)", "ttotal_s", "lower"),
+        ("Throughput (it/s)", "throughput"),
+        ("GPU idle (%)", "gpu_idle_pct"),
+        ("Comm (%)", "comm_pct"),
+        ("Total (s)", "ttotal_s"),
     ]
 
     stat_table = Table(
@@ -1270,21 +1268,19 @@ def _print_multi_rank_overview(rows: list[dict]) -> None:
     stat_table.add_column("max", justify="right")
     stat_table.add_column("imbalance", justify="right")
 
-    for label, key, direction in metric_specs:
+    for label, key in metric_specs:
         vals = np.array([float(r[key]) for r in rows if r[key] is not None], dtype=float)
         if vals.size == 0:
             stat_table.add_row(label, "-", "-", "-", "-", "-")
             continue
         vmin = float(np.min(vals))
+        vmean = float(np.mean(vals))
         vmed = float(np.median(vals))
         vp90 = float(np.percentile(vals, 90))
         vmax = float(np.max(vals))
-        if direction == "higher":
-            imbalance = vmed / vmax if vmax > 0 else 0.0
-            imbalance_txt = f"med/max={imbalance:.3f}"
-        else:
-            imbalance = vmax / vmed if vmed > 0 else 0.0
-            imbalance_txt = f"max/med={imbalance:.3f}"
+        # max/mean >= 1.0 in normal cases; higher means worse imbalance.
+        imbalance = vmax / vmean if vmean > 0 else float("inf")
+        imbalance_txt = f"max/mean={imbalance:.3f}"
         stat_table.add_row(label, f"{vmin:.3f}", f"{vmed:.3f}", f"{vp90:.3f}", f"{vmax:.3f}", imbalance_txt)
     console.print(stat_table)
 
@@ -1711,103 +1707,73 @@ def _print_multi_rank_overview(rows: list[dict]) -> None:
 
 def analyse_trace(
     dirpath: Union[str, Path],
-    device: int = 0,
-    all_ranks: bool = False,
-    max_ranks: Optional[int] = None,
+    max_ranks: Optional[int] = 1,
     detailed: bool = False,
-    detailed_rank: Optional[int] = 0,
     plot=False,
 ) -> None:
-    """Run the trace analysis pipeline on one rank or a multi-rank overview.
+    """Run the trace analysis pipeline over a selected set of trace files.
 
     Parameters
     ----------
     dirpath : str or Path
         Directory containing ``*.pt.trace.json`` files.
-    device : int
-        CUDA device index for memory analysis.
-    all_ranks : bool
-        If True, compute a lightweight overview over all rank trace files.
     max_ranks : int or None
-        Optional cap on number of rank files to process (sorted order).
-    detailed_rank : int or None
-        Rank for detailed breakdowns after all-rank overview. If None, skip
-        detailed per-section analysis.
+        Optional maximum rank index to include, interpreted as an inclusive
+        cap over the sorted trace-file list. ``0`` means only the first trace.
+    detailed : bool
+        If True, print detailed breakdown tables for each selected trace after
+        the overview and per-trace summary tables.
     """
     trace_files = find_trace_files(dirpath)
+    console.print(f"Analysing Traces in {dirpath}")
     if not trace_files:
         LOGGER.warning("No trace file found in %s", dirpath)
         return
 
-    if max_ranks is not None and max_ranks > 0:
-        trace_files = trace_files[:max_ranks]
+    selected_trace_files = trace_files
+    if max_ranks is not None and max_ranks >= 0:
+        selected_trace_files = selected_trace_files[: max_ranks]
 
-    filename = trace_files[0]
-    if not all_ranks:
-        console.print(f"Analysing {filename}")
-   # (
-        #batch_sizes_GB,
-        #batch_transfer_bw_GBs,
-        #batch_transfer_durations_us,
-        #dataloading_stall_durations_us,
-        #iteration_durations_us,
-        #kernel_durations,
-        #kernel_counts,
-        #kernel_weighted_occupancies,
-        #iteration_count,
-        #df,
-    #) = parse_json_trace_file(filename)
+    summaries = []
+    selected_rows = []
+    for index, trace_file in enumerate(selected_trace_files):
+        dfi = trace_to_dataframe(trace_file)
+        summary = _compute_rank_overview(dfi)
+        rank = summary.get("rank")
+        if rank is None and index == 0:
+            rank = 0
+            summary["rank"] = 0
 
-    #kernel_durations_sorted = sum_kernel_durations(kernel_durations)
-    #print_kernel_table(
-        #kernel_durations_sorted, kernel_counts, kernel_weighted_occupancies, top_n=10, num_iterations=iteration_count
-    #)
-    #console.print("\n")
-    #compute_av_time_per_iter_and_dl_stalls(iteration_durations_us, dataloading_stall_durations_us)
-    #console.print("\n")
-    #analyse_HtoD_memcpy(batch_sizes_GB, batch_transfer_bw_GBs, batch_transfer_durations_us)
-    #console.print("\n")
-    #analyse_gpu_memory_usage(device=device)
+        summary["trace_file"] = trace_file
+        summaries.append(summary)
+        selected_rows.append((rank, trace_file))
 
-    if all_ranks:
-        summaries = []
-        file_by_rank = {}
-        for tf in trace_files:
-            dfi = trace_to_dataframe(tf)
-            summary = _compute_rank_overview(dfi)
-            summary["trace_file"] = tf
-            summaries.append(summary)
-            if summary["rank"] is not None:
-                file_by_rank[summary["rank"]] = tf
+    console.print(f"Analysing {len(selected_trace_files)} trace files in the selected trace set")
+    _print_multi_rank_overview(summaries)
 
-        console.print(f"Analysing {len(trace_files)} trace files for all-rank overview")
-        _print_multi_rank_overview(summaries)
+    for row_index, (selected_rank, selected_file) in enumerate(selected_rows):
+        if selected_rank is None:
+            selected_rank = row_index
 
-        if detailed_rank is None:
-            console.print("[dim]Skipping detailed per-rank breakdowns (--detailed-rank=-1).[/dim]")
-            return
+        console.print(f"Analysing trace file from rank {selected_rank} {selected_file}")
+        df = trace_to_dataframe(selected_file)
+        print_trace_metadata(df)
+        console.print("\n")
+        total_time_breakdown(df, plot=plot)
+        console.print("\n")
+        gpu_time_breakdown(df, plot=plot)
+        console.print("\n")
 
-        selected_file = file_by_rank.get(detailed_rank)
-        if selected_file is None:
-            # Fall back to the slowest rank by throughput.
-            slowest = min(summaries, key=lambda r: r["throughput"]) if summaries else None
-            selected_file = slowest["trace_file"] if slowest else trace_files[0]
-            LOGGER.warning(
-                "Requested detailed rank %s not found; using slowest rank file %s",
-                detailed_rank,
-                selected_file,
-            )
-        filename = selected_file
-
-    console.print(f"Analysing {filename}")
-    df = trace_to_dataframe(filename)
-    print_trace_metadata(df)
-    console.print("\n")
-    total_time_breakdown(df, plot=plot)
-    console.print("\n")
-    gpu_time_breakdown(df, plot=plot)
-    console.print("\n")
     if not detailed:
+        console.print("[dim]Skipping detailed analysis.[/dim]")
+        return
+
+    for row_index, (selected_rank, selected_file) in enumerate(selected_rows):
+        if selected_rank is None:
+            selected_rank = row_index
+        console.print(f"Analysing detailed trace file from rank {selected_rank} {selected_file}")
+        df = trace_to_dataframe(selected_file)
+
         get_detailed_breakdown(df, section="model.encoder")
         get_detailed_breakdown(df, section="model.encoder", gpu=False)
         get_detailed_breakdown(df, section="model.processor")
@@ -1819,13 +1785,16 @@ def analyse_trace(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Analyse PyTorch profiler trace files.")
     parser.add_argument("target", help="Trace file or directory containing *.pt.trace.json files")
-    parser.add_argument("--all-ranks", action="store_true", help="Compute an overview across all rank trace files")
-    parser.add_argument("--max-ranks", type=int, default=None, help="Optional cap on number of rank files to process")
     parser.add_argument(
-        "--detailed-rank",
+        "--max-ranks",
         type=int,
-        default=0,
-        help="Rank used for detailed breakdowns after all-rank overview. Use -1 to skip detailed breakdowns.",
+        default=None,
+        help="Optional maximum rank index to include, interpreted inclusively over the sorted trace-file list.",
+    )
+    parser.add_argument(
+        "--detailed",
+        action="store_true",
+        help="Print detailed breakdown tables for each selected trace.",
     )
     args = parser.parse_args()
 
@@ -1833,17 +1802,15 @@ if __name__ == "__main__":
     if os.path.isdir(target):
         analyse_trace(
             target,
-            all_ranks=args.all_ranks,
             max_ranks=args.max_ranks,
-            detailed_rank=None if args.detailed_rank < 0 else args.detailed_rank,
+            detailed=args.detailed,
         )
     else:
         # Single file: wrap its parent directory logic or analyse directly.
         dirpath = os.path.dirname(target) or "."
         analyse_trace(
             dirpath,
-            all_ranks=args.all_ranks,
             max_ranks=args.max_ranks,
-            detailed_rank=None if args.detailed_rank < 0 else args.detailed_rank,
+            detailed=args.detailed,
         )
 
