@@ -98,7 +98,15 @@ class AnemoiProfiler(AnemoiTrainer):
         if memory_metrics_df is not None:
             #warnings.warn("INFO: Memory Report metrics represent metrics aggregated across all nodes")
             #self.print_report("Memory Profiling", memory_metrics_df, color="purple", emoji="floppy_disk")
-            analyse_trace(self.profiler.dirpath)
+            trace_cfg = self.config.diagnostics.benchmark_profiler.trace_analyser
+            analyse_trace(
+                self.profiler.dirpath,
+                all_ranks=trace_cfg.all_ranks,
+                plot=trace_cfg.plot,
+                max_ranks=trace_cfg.max_ranks,
+                detailed=trace_cfg.detailed,
+                detailed_rank=(None if trace_cfg.detailed_rank < 0 else trace_cfg.detailed_rank),
+            )
 
         if system_metrics_df is not None:
             self.print_report("System Profiling", system_metrics_df, color="Red", emoji="desktop_computer")

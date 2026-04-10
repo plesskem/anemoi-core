@@ -19,3 +19,9 @@ snapshot:
   enabled: True
   steps: 4 # wait warmup steps and then do steps
   warmup: 0
+trace_analyser:
+  all_ranks: True
+  detailed: True
+  plot: False
+  max_ranks: null
+  detailed_rank: 0 # set to -1 to skip detailed breakdown in all-rank mode

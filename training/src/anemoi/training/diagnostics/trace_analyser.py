@@ -6,6 +6,7 @@ duration breakdowns, data loading stalls, memory usage, and per-component
 runtime analysis.
 """
 
+import argparse
 import json
 import logging
 import os
@@ -131,7 +132,7 @@ def trace_to_dataframe(trace_file: str, cols: Optional[list[str]] = None) -> pd.
         df = df.dropna(subset=["dur"])
     df["rank"] = rank
 
-    # Attach metadata in attrs (preferred), and keep attribute access for compatibility.
+    # Attach metadata via pandas attrs (safe/custom metadata channel).
     df.attrs["device_properties"] = device_properties
     df.attrs["cuda_runtime_version"] = cuda_runtime_version
     df.attrs["cuda_driver_version"] = cuda_driver_version
@@ -139,14 +140,6 @@ def trace_to_dataframe(trace_file: str, cols: Optional[list[str]] = None) -> pd.
     df.attrs["framework"] = framework
     df.attrs["trace_id"] = trace_id
     df.attrs["distributed_info"] = distributed_info
-
-    df.device_properties = device_properties
-    df.cuda_runtime_version = cuda_runtime_version
-    df.cuda_driver_version = cuda_driver_version
-    df.cupti_version = cupti_version
-    df.framework = framework
-    df.trace_id = trace_id
-    df.distributed_info = distributed_info
 
     return df
 
@@ -500,6 +493,22 @@ def _merged_duration(df: pd.DataFrame) -> float:
     return float((merged["end_time"] - merged["ts"]).sum())
 
 
+def _batch_stats(df: pd.DataFrame) -> tuple[int, float, float, float]:
+    """Return batch count, average batch duration (us), throughput (it/s), total batch duration (us)."""
+    batch_df = df[df["name"].str.contains("run_training_batch", na=False)]
+    if "dur" in batch_df.columns:
+        batch_df = batch_df.dropna(subset=["dur"])
+
+    nbatches = int(len(batch_df))
+    if nbatches == 0:
+        return 0, 0.0, 0.0, 0.0
+
+    mean_batch_us = float(batch_df["dur"].mean())
+    throughput = (1e6 / mean_batch_us) if mean_batch_us > 0 else 0.0
+    total_batch_us = float(batch_df["dur"].sum())
+    return nbatches, mean_batch_us, throughput, total_batch_us
+
+
 def _savefig(fig, savepath: str) -> None:
     """Save figure with format-appropriate DPI."""
     if savepath:
@@ -509,9 +518,9 @@ def _savefig(fig, savepath: str) -> None:
                     facecolor="white")
 
 
-def _suptitle(fig, nbatches: int, ttotal_us: float) -> None:
+def _suptitle(fig, nbatches: int, ttotal_us: float, mean_batch_us: float = 0.0) -> None:
     """Attach a standard throughput suptitle to a figure."""
-    throughput = nbatches / (ttotal_us / 1e6) if ttotal_us > 0 else 0
+    throughput = (1e6 / mean_batch_us) if mean_batch_us > 0 else (nbatches / (ttotal_us / 1e6) if ttotal_us > 0 else 0)
     fig.suptitle(
         f"Batches: {nbatches}  ·  Total: {ttotal_us / 1e6:.3f} s  ·  "
         f"Throughput: {throughput:.2f} it/s",
@@ -671,6 +680,7 @@ def _build_section_comm_table(
     rows: list[dict],
     ttotal_us: float,
     nbatches: int,
+    total_batch_us: float,
     footer_label: str,
     footer_dur_us: float,
 ) -> Table:
@@ -689,6 +699,8 @@ def _build_section_comm_table(
     t.add_column("Duration (s)", justify="right", footer=f"[dim]{footer_dur_us / 1e6:.3f}[/dim]")
     t.add_column("Per batch (ms)", justify="right", footer=f"[dim]{footer_ms}[/dim]")
     t.add_column("% of Total", justify="right", footer=f"[dim]{footer_pct_total}[/dim]")
+    t.add_column("% of Batch", justify="right", footer="")
+    t.add_column("Eq. it/s", justify="right", footer="")
     t.add_column("Comm (s)", justify="right", footer="")
     t.add_column("Comm % Section", justify="right", footer="")
     t.add_column("Comm % Total", justify="right", footer="")
@@ -698,6 +710,8 @@ def _build_section_comm_table(
         comm_us = float(r.get("comm_us", 0.0))
         pct_total = f"{100 * dur_us / ttotal_us:.2f}%" if ttotal_us > 0 else "—"
         per_batch_ms = f"{dur_us / nbatches / 1e3:.2f}" if nbatches > 0 else "—"
+        pct_batch = f"{100 * dur_us / total_batch_us:.2f}%" if total_batch_us > 0 else "—"
+        eq_it_s = f"{1e6 / (dur_us / nbatches):.2f}" if nbatches > 0 and dur_us > 0 else "—"
         comm_pct_section = f"{100 * comm_us / dur_us:.2f}%" if dur_us > 0 else "—"
         comm_pct_total = f"{100 * comm_us / ttotal_us:.2f}%" if ttotal_us > 0 else "—"
         t.add_row(
@@ -705,6 +719,8 @@ def _build_section_comm_table(
             f"{dur_us / 1e6:.3f}",
             per_batch_ms,
             pct_total,
+            pct_batch,
+            eq_it_s,
             f"{comm_us / 1e6:.3f}",
             comm_pct_section,
             comm_pct_total,
@@ -718,6 +734,7 @@ def _plot_time_breakdowns(
     enc_dec_data: Optional[tuple],
     nbatches: int,
     ttotal_recorded: float,
+    mean_batch_us: float = 0.0,
     savepath: str = "",
 ) -> None:
     """Plot publication-quality pie charts for time breakdowns."""
@@ -734,7 +751,7 @@ def _plot_time_breakdowns(
         if len(charts) == 1:
             axes = [axes]
 
-        _suptitle(fig, nbatches, ttotal_recorded)
+        _suptitle(fig, nbatches, ttotal_recorded, mean_batch_us)
 
         for idx, (ax, chart, panel) in enumerate(zip(axes, charts, panel_labels)):
             if len(chart) == 3:
@@ -793,6 +810,7 @@ def _plot_gpu_time_breakdown(
     times_us: list[float],
     ttotal: float,
     nbatches: int,
+    mean_batch_us: float = 0.0,
     savepath: str = "",
 ) -> None:
     """Plot a publication-quality bar chart for the GPU time breakdown."""
@@ -802,7 +820,7 @@ def _plot_gpu_time_breakdown(
 
     with mpl.rc_context(_PUB_RC):
         fig, ax = plt.subplots(figsize=(6, 3.8), facecolor="white")
-        _suptitle(fig, nbatches, ttotal)
+        _suptitle(fig, nbatches, ttotal, mean_batch_us)
 
         bars = ax.bar(range(len(labels)), values_s,
                       color=colors[:len(labels)], edgecolor="white", linewidth=0.8)
@@ -836,7 +854,7 @@ def total_time_breakdown(
 ) -> pd.DataFrame:
     """Print a coarse-grained time breakdown and optionally plot pie charts."""
     df = _load_df(tracefile_or_df)
-    nbatches = len(df[df["name"].str.contains("run_training_batch", na=False)])
+    nbatches, mean_batch_us, throughput, total_batch_us = _batch_stats(df)
 
     console.print()
     console.rule(f"TIME BREAKDOWN — {nbatches} recorded batches")
@@ -844,6 +862,12 @@ def total_time_breakdown(
     fwd_bwd_data = enc_dec_data = None
     ttotal_recorded = float(df["end_time"].max() - df["ts"].min()) if not df.empty else 0.0
     comm_events = df[df["name"].str.contains("nccl", case=False, na=False)].sort_values("ts")
+    batch_events = df[df["name"].str.contains("run_training_batch", na=False)].sort_values("ts")
+    batch_intervals = (
+        merge_overlapping_intervals_df(batch_events[["ts", "end_time"]])
+        if not batch_events.empty
+        else pd.DataFrame(columns=["ts", "end_time"])
+    )
     comm_intervals = (
         merge_overlapping_intervals_df(comm_events[["ts", "end_time"]])
         if not comm_events.empty
@@ -874,10 +898,10 @@ def total_time_breakdown(
             continue
 
         if chart_idx == 0:
-            throughput = nbatches / (ttotal / 1e6)
             console.print(
                 f"\n[bold]Total:[/bold] [yellow]{ttotal / 1e6:.2f} s[/yellow]  "
-                f"[bold]Throughput:[/bold] [yellow]{throughput:.2f} it/s[/yellow]\n"
+                f"[bold]Throughput:[/bold] [yellow]{throughput:.2f} it/s[/yellow]  "
+                f"[dim](avg run_training_batch = {mean_batch_us / 1e6:.3f} s)[/dim]\n"
             )
 
         rows = [{"label": l, "dur_us": float(t)} for l, t in zip(chart_labels, tselected_l)]
@@ -890,6 +914,9 @@ def total_time_breakdown(
                 if not section_events.empty
                 else pd.DataFrame(columns=["ts", "end_time"])
             )
+            # Restrict section time to iteration windows for per-batch realism.
+            if not batch_intervals.empty:
+                row["dur_us"] = _interval_overlap_duration(section_intervals, batch_intervals)
             row["comm_us"] = _interval_overlap_duration(section_intervals, comm_intervals)
             rows_with_comm.append(row)
 
@@ -898,6 +925,7 @@ def total_time_breakdown(
             rows=rows_with_comm,
             ttotal_us=ttotal,
             nbatches=nbatches,
+            total_batch_us=total_batch_us,
             footer_label="Elsewhere",
             footer_dur_us=float(tidle),
         )
@@ -920,7 +948,14 @@ def total_time_breakdown(
     console.print("[dim]ℹ  Note: not all decoder/encoder/processor sections are instrumented yet.[/dim]\n")
 
     if plot and ttotal_recorded > 0 and (fwd_bwd_data or enc_dec_data):
-        _plot_time_breakdowns(fwd_bwd_data, enc_dec_data, nbatches, ttotal_recorded, savepath)
+        _plot_time_breakdowns(
+            fwd_bwd_data,
+            enc_dec_data,
+            nbatches,
+            ttotal_recorded,
+            mean_batch_us=mean_batch_us,
+            savepath=savepath,
+        )
 
     return df
 
@@ -931,14 +966,14 @@ def gpu_time_breakdown(
     """Print a GPU-centric time breakdown and optionally plot a bar chart."""
     df = _load_df(tracefile_or_df)
     ttotal = float(df["end_time"].max() - df["ts"].min())
-    nbatches = len(df[df["name"].str.contains("run_training_batch", na=False)])
+    nbatches, mean_batch_us, throughput, _ = _batch_stats(df)
 
     console.print()
     console.rule(f"GPU TIME BREAKDOWN — {nbatches} recorded batches")
-    throughput = nbatches / (ttotal / 1e6) if ttotal > 0 else 0
     console.print(
         f"\n[bold]Total:[/bold] [yellow]{ttotal / 1e6:.3f} s[/yellow]  "
-        f"[bold]Throughput:[/bold] [yellow]{throughput:.2f} it/s[/yellow]\n"
+        f"[bold]Throughput:[/bold] [yellow]{throughput:.2f} it/s[/yellow]  "
+        f"[dim](avg run_training_batch = {mean_batch_us / 1e6:.3f} s)[/dim]\n"
     )
 
     sections = [
@@ -996,7 +1031,7 @@ def gpu_time_breakdown(
 
     if plot and ttotal > 0:
         _plot_gpu_time_breakdown(section_labels + ["GPU Idle"],
-                                 section_times + [gpu_idle], ttotal, nbatches, savepath)
+                                 section_times + [gpu_idle], ttotal, nbatches, mean_batch_us=mean_batch_us, savepath=savepath)
     return summary_df
 
 def get_detailed_breakdown(
@@ -1102,6 +1137,156 @@ def find_first_trace_file(dirpath: Union[str, Path]) -> Optional[str]:
         if filename.endswith(".pt.trace.json"):
             return os.path.join(dirpath, filename)
     return None
+
+
+def find_trace_files(dirpath: Union[str, Path]) -> list[str]:
+    """Find all ``*.pt.trace.json`` files in a directory (non-recursively)."""
+    return [
+        os.path.join(dirpath, filename)
+        for filename in sorted(os.listdir(dirpath))
+        if filename.endswith(".pt.trace.json")
+    ]
+
+
+def _rank_from_df(df: pd.DataFrame) -> Optional[int]:
+    """Extract rank from DataFrame metadata/column when available."""
+    rank = df.attrs.get("distributed_info", {}).get("rank") if isinstance(df.attrs.get("distributed_info"), dict) else None
+    if rank is None and "rank" in df.columns and not df.empty:
+        rank_val = df["rank"].iloc[0]
+        if pd.notna(rank_val):
+            rank = int(rank_val)
+    return rank
+
+
+def _compute_rank_overview(df: pd.DataFrame) -> dict:
+    """Compute lightweight per-rank summary metrics for multi-rank overview."""
+    dfx = _load_df(df)
+    if dfx.empty:
+        return {
+            "rank": _rank_from_df(dfx),
+            "ttotal_s": 0.0,
+            "nbatches": 0,
+            "throughput": 0.0,
+            "gpu_active_s": 0.0,
+            "gpu_idle_s": 0.0,
+            "gpu_idle_pct": 0.0,
+            "comm_s": 0.0,
+            "comm_pct": 0.0,
+        }
+
+    ttotal = float(dfx["end_time"].max() - dfx["ts"].min())
+    nbatches, mean_batch_us, throughput, total_batch_us = _batch_stats(dfx)
+
+    # Mirror section logic from gpu_time_breakdown for consistent definitions.
+    sections = [
+        ("Computation", {"cat": ["kernel"], "name": [], "excl": ["nccl"]}),
+        ("Communication", {"cat": [], "name": ["nccl"], "excl": []}),
+        ("Memory Ops", {"cat": ["gpu_memcpy", "gpu_memset"], "name": [], "excl": []}),
+    ]
+
+    section_times = {}
+    merged_sections = {}
+    for label, filt in sections:
+        d = dfx.copy()
+        if filt["cat"]:
+            d = d[d["cat"].str.contains("|".join(filt["cat"]), na=False)]
+        if filt["name"]:
+            d = d[d["name"].str.contains("|".join(filt["name"]), na=False)]
+        if filt["excl"]:
+            d = d[~d["name"].str.contains("|".join(filt["excl"]), na=False)]
+        section_times[label] = _merged_duration(d.sort_values("ts"))
+        merged_sections[label] = merge_overlapping_intervals_df(d[["ts", "end_time"]]) if not d.empty else pd.DataFrame()
+
+    merged_active_parts = [merged_sections[k] for k in ("Computation", "Communication", "Memory Ops") if not merged_sections[k].empty]
+    gpu_active = _merged_duration(pd.concat(merged_active_parts, ignore_index=True)) if merged_active_parts else 0.0
+    gpu_idle = max(ttotal - gpu_active, 0.0)
+
+    comm = float(section_times["Communication"])
+    return {
+        "rank": _rank_from_df(dfx),
+        "ttotal_s": ttotal / 1e6,
+        "nbatches": nbatches,
+        "throughput": throughput,
+        "mean_batch_s": mean_batch_us / 1e6,
+        "total_batch_s": total_batch_us / 1e6,
+        "gpu_active_s": gpu_active / 1e6,
+        "gpu_idle_s": gpu_idle / 1e6,
+        "gpu_idle_pct": 100.0 * gpu_idle / ttotal if ttotal > 0 else 0.0,
+        "comm_s": comm / 1e6,
+        "comm_pct": 100.0 * comm / ttotal if ttotal > 0 else 0.0,
+    }
+
+
+def _print_multi_rank_overview(rows: list[dict]) -> None:
+    """Print per-rank metrics and aggregate distribution statistics."""
+    if not rows:
+        console.print("[yellow]⚠ No ranks to summarize.[/yellow]")
+        return
+
+    rows_sorted = sorted(rows, key=lambda x: (x["rank"] is None, x["rank"]))
+
+    table = Table(
+        title="All-rank performance overview",
+        box=box.SIMPLE_HEAVY,
+        header_style="bold cyan",
+        show_lines=False,
+    )
+    table.add_column("Rank", justify="right")
+    table.add_column("Total (s)", justify="right")
+    table.add_column("Batches", justify="right")
+    table.add_column("Throughput (it/s)", justify="right")
+    table.add_column("GPU idle (%)", justify="right")
+    table.add_column("Comm (%)", justify="right")
+    for r in rows_sorted:
+        rank_txt = "?" if r["rank"] is None else str(r["rank"])
+        table.add_row(
+            rank_txt,
+            f"{r['ttotal_s']:.3f}",
+            str(r["nbatches"]),
+            f"{r['throughput']:.2f}",
+            f"{r['gpu_idle_pct']:.2f}",
+            f"{r['comm_pct']:.2f}",
+        )
+    console.print()
+    console.print(table)
+
+    metric_specs = [
+        ("Throughput (it/s)", "throughput", "higher"),
+        ("GPU idle (%)", "gpu_idle_pct", "lower"),
+        ("Comm (%)", "comm_pct", "lower"),
+        ("Total (s)", "ttotal_s", "lower"),
+    ]
+
+    stat_table = Table(
+        title="Rank distribution stats",
+        box=box.SIMPLE,
+        header_style="bold magenta",
+        show_lines=False,
+    )
+    stat_table.add_column("Metric")
+    stat_table.add_column("min", justify="right")
+    stat_table.add_column("median", justify="right")
+    stat_table.add_column("p90", justify="right")
+    stat_table.add_column("max", justify="right")
+    stat_table.add_column("imbalance", justify="right")
+
+    for label, key, direction in metric_specs:
+        vals = np.array([float(r[key]) for r in rows if r[key] is not None], dtype=float)
+        if vals.size == 0:
+            stat_table.add_row(label, "-", "-", "-", "-", "-")
+            continue
+        vmin = float(np.min(vals))
+        vmed = float(np.median(vals))
+        vp90 = float(np.percentile(vals, 90))
+        vmax = float(np.max(vals))
+        if direction == "higher":
+            imbalance = vmed / vmax if vmax > 0 else 0.0
+            imbalance_txt = f"med/max={imbalance:.3f}"
+        else:
+            imbalance = vmax / vmed if vmed > 0 else 0.0
+            imbalance_txt = f"max/med={imbalance:.3f}"
+        stat_table.add_row(label, f"{vmin:.3f}", f"{vmed:.3f}", f"{vp90:.3f}", f"{vmax:.3f}", imbalance_txt)
+    console.print(stat_table)
 
 
 #def analyze_anemoi_durations(json_file_path: str) -> dict:
@@ -1524,8 +1709,16 @@ def find_first_trace_file(dirpath: Union[str, Path]) -> Optional[str]:
         #)
 
 
-def analyse_trace(dirpath: Union[str, Path], device: int = 0) -> None:
-    """Run the full trace analysis pipeline on the first trace file in a directory.
+def analyse_trace(
+    dirpath: Union[str, Path],
+    device: int = 0,
+    all_ranks: bool = False,
+    max_ranks: Optional[int] = None,
+    detailed: bool = False,
+    detailed_rank: Optional[int] = 0,
+    plot=False,
+) -> None:
+    """Run the trace analysis pipeline on one rank or a multi-rank overview.
 
     Parameters
     ----------
@@ -1533,13 +1726,25 @@ def analyse_trace(dirpath: Union[str, Path], device: int = 0) -> None:
         Directory containing ``*.pt.trace.json`` files.
     device : int
         CUDA device index for memory analysis.
+    all_ranks : bool
+        If True, compute a lightweight overview over all rank trace files.
+    max_ranks : int or None
+        Optional cap on number of rank files to process (sorted order).
+    detailed_rank : int or None
+        Rank for detailed breakdowns after all-rank overview. If None, skip
+        detailed per-section analysis.
     """
-    filename = find_first_trace_file(dirpath)
-    if filename is None:
+    trace_files = find_trace_files(dirpath)
+    if not trace_files:
         LOGGER.warning("No trace file found in %s", dirpath)
         return
 
-    console.print(f"Analysing {filename}")
+    if max_ranks is not None and max_ranks > 0:
+        trace_files = trace_files[:max_ranks]
+
+    filename = trace_files[0]
+    if not all_ranks:
+        console.print(f"Analysing {filename}")
    # (
         #batch_sizes_GB,
         #batch_transfer_bw_GBs,
@@ -1564,33 +1769,81 @@ def analyse_trace(dirpath: Union[str, Path], device: int = 0) -> None:
     #console.print("\n")
     #analyse_gpu_memory_usage(device=device)
 
+    if all_ranks:
+        summaries = []
+        file_by_rank = {}
+        for tf in trace_files:
+            dfi = trace_to_dataframe(tf)
+            summary = _compute_rank_overview(dfi)
+            summary["trace_file"] = tf
+            summaries.append(summary)
+            if summary["rank"] is not None:
+                file_by_rank[summary["rank"]] = tf
+
+        console.print(f"Analysing {len(trace_files)} trace files for all-rank overview")
+        _print_multi_rank_overview(summaries)
+
+        if detailed_rank is None:
+            console.print("[dim]Skipping detailed per-rank breakdowns (--detailed-rank=-1).[/dim]")
+            return
+
+        selected_file = file_by_rank.get(detailed_rank)
+        if selected_file is None:
+            # Fall back to the slowest rank by throughput.
+            slowest = min(summaries, key=lambda r: r["throughput"]) if summaries else None
+            selected_file = slowest["trace_file"] if slowest else trace_files[0]
+            LOGGER.warning(
+                "Requested detailed rank %s not found; using slowest rank file %s",
+                detailed_rank,
+                selected_file,
+            )
+        filename = selected_file
+
+    console.print(f"Analysing {filename}")
     df = trace_to_dataframe(filename)
     print_trace_metadata(df)
     console.print("\n")
-    total_time_breakdown(df)
+    total_time_breakdown(df, plot=plot)
     console.print("\n")
-    gpu_time_breakdown(df)
+    gpu_time_breakdown(df, plot=plot)
     console.print("\n")
-    get_detailed_breakdown(df, section="model.encoder")
-    get_detailed_breakdown(df, section="model.encoder", gpu=False)
-    get_detailed_breakdown(df, section="model.processor")
-    get_detailed_breakdown(df, section="model.processor", gpu=False)
-    get_detailed_breakdown(df, section="model.decoder")
-    get_detailed_breakdown(df, section="model.decoder", gpu=False)
+    if not detailed:
+        get_detailed_breakdown(df, section="model.encoder")
+        get_detailed_breakdown(df, section="model.encoder", gpu=False)
+        get_detailed_breakdown(df, section="model.processor")
+        get_detailed_breakdown(df, section="model.processor", gpu=False)
+        get_detailed_breakdown(df, section="model.decoder")
+        get_detailed_breakdown(df, section="model.decoder", gpu=False)
 
 
 if __name__ == "__main__":
-    import sys
+    parser = argparse.ArgumentParser(description="Analyse PyTorch profiler trace files.")
+    parser.add_argument("target", help="Trace file or directory containing *.pt.trace.json files")
+    parser.add_argument("--all-ranks", action="store_true", help="Compute an overview across all rank trace files")
+    parser.add_argument("--max-ranks", type=int, default=None, help="Optional cap on number of rank files to process")
+    parser.add_argument(
+        "--detailed-rank",
+        type=int,
+        default=0,
+        help="Rank used for detailed breakdowns after all-rank overview. Use -1 to skip detailed breakdowns.",
+    )
+    args = parser.parse_args()
 
-    if len(sys.argv) < 2:
-        console.print("Usage: python trace_analyser.py <trace_file_or_directory>")
-        sys.exit(1)
-
-    target = sys.argv[1]
+    target = args.target
     if os.path.isdir(target):
-        analyse_trace(target)
+        analyse_trace(
+            target,
+            all_ranks=args.all_ranks,
+            max_ranks=args.max_ranks,
+            detailed_rank=None if args.detailed_rank < 0 else args.detailed_rank,
+        )
     else:
-        # Single file: wrap its parent directory logic or analyse directly
+        # Single file: wrap its parent directory logic or analyse directly.
         dirpath = os.path.dirname(target) or "."
-        analyse_trace(dirpath)
+        analyse_trace(
+            dirpath,
+            all_ranks=args.all_ranks,
+            max_ranks=args.max_ranks,
+            detailed_rank=None if args.detailed_rank < 0 else args.detailed_rank,
+        )
 
