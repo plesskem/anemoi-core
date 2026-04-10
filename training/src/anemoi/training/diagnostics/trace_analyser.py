@@ -25,6 +25,52 @@ LOGGER = logging.getLogger(__name__)
 console = Console(record=True, width=200)
 
 
+def _parse_device_properties(device_list: list) -> dict:
+    """Parse device properties from trace metadata.
+
+    Parameters
+    ----------
+    device_list : list
+        List of device property dictionaries from the trace file.
+
+    Returns
+    -------
+    dict
+        Dictionary mapping device ID to device properties, including:
+        - name: Device name
+        - totalGlobalMem: Total global memory in bytes
+        - totalGlobalMemGB: Total global memory in GB
+        - computeMajor, computeMinor: Compute capability version
+        - maxThreadsPerBlock, maxThreadsPerMultiprocessor: Thread limits
+        - regsPerBlock, regsPerMultiprocessor: Register limits
+        - warpSize: Warp size
+        - sharedMemPerBlock, sharedMemPerBlockOptIn, sharedMemPerMultiprocessor: Shared memory sizes
+        - numSms: Number of streaming multiprocessors
+    """
+    devices = {}
+    for device in device_list:
+        device_id = device.get("id")
+        if device_id is not None:
+            total_mem = device.get("totalGlobalMem")
+            devices[device_id] = {
+                "name": device.get("name"),
+                "totalGlobalMem": total_mem,
+                "totalGlobalMemGB": total_mem / (1024**3) if total_mem else None,
+                "computeMajor": device.get("computeMajor"),
+                "computeMinor": device.get("computeMinor"),
+                "maxThreadsPerBlock": device.get("maxThreadsPerBlock"),
+                "maxThreadsPerMultiprocessor": device.get("maxThreadsPerMultiprocessor"),
+                "regsPerBlock": device.get("regsPerBlock"),
+                "warpSize": device.get("warpSize"),
+                "sharedMemPerBlock": device.get("sharedMemPerBlock"),
+                "sharedMemPerBlockOptIn": device.get("sharedMemPerBlockOptin"),
+                "numSms": device.get("numSms"),
+                "regsPerMultiprocessor": device.get("regsPerMultiprocessor"),
+                "sharedMemPerMultiprocessor": device.get("sharedMemPerMultiprocessor"),
+            }
+    return devices if devices else None
+
+
 def trace_to_dataframe(trace_file: str, cols: Optional[list[str]] = None) -> pd.DataFrame:
     """Read a PyTorch trace JSON file and convert it into a pandas DataFrame.
 
@@ -39,13 +85,34 @@ def trace_to_dataframe(trace_file: str, cols: Optional[list[str]] = None) -> pd.
     -------
     pd.DataFrame
         DataFrame containing the trace events with a 'rank' column.
+        Additional metadata is attached as DataFrame attributes:
+        - device_properties: dict mapping device ID to device info
+        - cuda_runtime_version: CUDA runtime version (int)
+        - cuda_driver_version: CUDA driver version (int)
+        - cupti_version: CUPTI version (int)
+        - framework: Framework name (str)
+        - trace_id: Trace ID (str)
+        - distributed_info: Distributed training configuration (dict)
     """
     with open(trace_file, "r") as f:
         trace_data = json.load(f)
 
+    # Extract device properties
+    device_properties = None
+    if "deviceProperties" in trace_data:
+        device_properties = _parse_device_properties(trace_data["deviceProperties"])
+
+    # Extract CUDA and framework metadata
+    cuda_runtime_version = trace_data.get("cuda_runtime_version")
+    cuda_driver_version = trace_data.get("cuda_driver_version")
+    cupti_version = trace_data.get("cupti_version")
+    framework = trace_data.get("Framework")
+    trace_id = trace_data.get("trace_id")
+    distributed_info = trace_data.get("distributedInfo")
+
     rank = None
-    if "distributedInfo" in trace_data:
-        rank = trace_data["distributedInfo"].get("rank")
+    if distributed_info:
+        rank = distributed_info.get("rank")
 
     if "traceEvents" not in trace_data:
         error_msg = "The JSON file does not contain 'traceEvents'."
@@ -63,6 +130,24 @@ def trace_to_dataframe(trace_file: str, cols: Optional[list[str]] = None) -> pd.
     if "dur" in df.columns:
         df = df.dropna(subset=["dur"])
     df["rank"] = rank
+
+    # Attach metadata in attrs (preferred), and keep attribute access for compatibility.
+    df.attrs["device_properties"] = device_properties
+    df.attrs["cuda_runtime_version"] = cuda_runtime_version
+    df.attrs["cuda_driver_version"] = cuda_driver_version
+    df.attrs["cupti_version"] = cupti_version
+    df.attrs["framework"] = framework
+    df.attrs["trace_id"] = trace_id
+    df.attrs["distributed_info"] = distributed_info
+
+    df.device_properties = device_properties
+    df.cuda_runtime_version = cuda_runtime_version
+    df.cuda_driver_version = cuda_driver_version
+    df.cupti_version = cupti_version
+    df.framework = framework
+    df.trace_id = trace_id
+    df.distributed_info = distributed_info
+
     return df
 
 
@@ -290,8 +375,8 @@ def _build_breakdown_table(
     df_display: pd.DataFrame,
     title: str,
     section: str,
-    ttime_exc_overlap: float,
-    ttime_exc_overlap_p: float,
+    ttime_active: float,
+    ttime_active_p: float,
 ) -> Table:
     """Build a Rich Table for a subset of the breakdown dataframe."""
 
@@ -351,13 +436,13 @@ def _build_breakdown_table(
         header_style="bold cyan",
         show_footer=True,
     )
-    table.add_column("Method",    style="bold",    footer="[dim]Total (excl. overlap)[/dim]")
-    table.add_column("Total (s)", justify="right", footer=f"[dim]{ttime_exc_overlap / 1e6:.3f}[/dim]")
-    table.add_column("# Calls",   justify="right", footer="")
-    table.add_column("Avg (µs)",  justify="right", footer="")
-    table.add_column("Max (µs)",  justify="right", footer="")
-    table.add_column("Min (µs)",  justify="right", footer="")
-    table.add_column("Overlap %", justify="right", footer=f"[dim]{ttime_exc_overlap_p:.2f}%[/dim]")
+    table.add_column("Method",        style="bold",    footer=f"[dim]Top-10 active total ({ttime_active_p:.2f}%)[/dim]")
+    table.add_column("Total (s)",     justify="right", footer=f"[dim]{ttime_active / 1e6:.3f}")
+    table.add_column("# Calls",       justify="right", footer="")
+    table.add_column("Avg (µs)",      justify="right", footer="")
+    table.add_column("Max (µs)",      justify="right", footer="")
+    table.add_column("Min (µs)",      justify="right", footer="")
+    table.add_column("Overlap %", justify="right", footer="")
 
     for _, row in df_display.iterrows():
         table.add_row(
@@ -392,6 +477,7 @@ _PUB_RC = {
 _PALETTES = [
     ["#4878CF", "#D65F5F", "#6ACC65", "#B8B8B8"],
     ["#7B4173", "#A9B800", "#E49444", "#B8B8B8"],
+    ["#009E73", "#D55E00", "#56B4E9", "#CC79A7", "#B8B8B8"],
 ]
 _TEXT_COLOR = "#1A1A1A"
 
@@ -467,6 +553,165 @@ def _build_summary_table(
     return t
 
 
+def _interval_overlap_duration(intervals_a: pd.DataFrame, intervals_b: pd.DataFrame) -> float:
+    """Compute total overlap duration between two merged interval DataFrames."""
+    if intervals_a.empty or intervals_b.empty:
+        return 0.0
+
+    a = intervals_a[["ts", "end_time"]].sort_values("ts").to_numpy()
+    b = intervals_b[["ts", "end_time"]].sort_values("ts").to_numpy()
+
+    i = 0
+    j = 0
+    overlap = 0.0
+    while i < len(a) and j < len(b):
+        start = max(a[i][0], b[j][0])
+        end = min(a[i][1], b[j][1])
+        if end > start:
+            overlap += float(end - start)
+
+        if a[i][1] <= b[j][1]:
+            i += 1
+        else:
+            j += 1
+
+    return overlap
+
+
+def _format_cuda_version(version: Optional[int]) -> str:
+    """Format CUDA version encoded as an integer (e.g. 12080 -> 12.8)."""
+    if not version:
+        return "-"
+    major = version // 1000
+    minor = (version % 1000) // 10
+    return f"{major}.{minor}"
+
+
+def print_trace_metadata(df: pd.DataFrame) -> None:
+    """Print a concise summary of trace metadata and detected devices."""
+    attrs = getattr(df, "attrs", {})
+
+    distributed_info = attrs.get("distributed_info")
+    if distributed_info is None:
+        distributed_info = getattr(df, "distributed_info", None)
+
+    framework = attrs.get("framework", getattr(df, "framework", None))
+    trace_id = attrs.get("trace_id", getattr(df, "trace_id", None))
+    cupti_version = attrs.get("cupti_version", getattr(df, "cupti_version", None))
+    cuda_runtime_version = attrs.get("cuda_runtime_version", getattr(df, "cuda_runtime_version", None))
+    cuda_driver_version = attrs.get("cuda_driver_version", getattr(df, "cuda_driver_version", None))
+    device_properties = attrs.get("device_properties", getattr(df, "device_properties", None))
+
+    table = Table(
+        title="Trace metadata",
+        box=box.SIMPLE_HEAVY,
+        header_style="bold cyan",
+        show_lines=False,
+    )
+    table.add_column("Field", style="bold")
+    table.add_column("Value")
+
+    table.add_row("Framework", framework or "-")
+    table.add_row("Trace ID", trace_id or "-")
+    table.add_row("CUPTI", str(cupti_version) if cupti_version is not None else "-")
+    table.add_row("CUDA runtime", _format_cuda_version(cuda_runtime_version))
+    table.add_row("CUDA driver", _format_cuda_version(cuda_driver_version))
+
+    if isinstance(distributed_info, dict):
+        rank = distributed_info.get("rank", "-")
+        world_size = distributed_info.get("world_size", "-")
+        backend = distributed_info.get("backend", "-")
+        table.add_row("Distributed", f"rank {rank}/{world_size}, backend={backend}")
+    else:
+        table.add_row("Distributed", "-")
+
+    if isinstance(device_properties, dict) and device_properties:
+        nd = len(device_properties)
+        names = sorted({d.get("name", "Unknown") for d in device_properties.values()})
+        table.add_row("Devices", f"{nd} ({', '.join(names)})")
+    else:
+        table.add_row("Devices", "-")
+
+    console.print()
+    console.print(table)
+
+    if isinstance(device_properties, dict) and device_properties:
+        dev_table = Table(
+            title="Device details",
+            box=box.SIMPLE,
+            header_style="bold magenta",
+            show_lines=False,
+        )
+        dev_table.add_column("ID", justify="right")
+        dev_table.add_column("Name")
+        dev_table.add_column("Mem (GB)", justify="right")
+        dev_table.add_column("CC", justify="center")
+        dev_table.add_column("SMs", justify="right")
+        dev_table.add_column("Warp", justify="right")
+
+        for dev_id in sorted(device_properties):
+            info = device_properties[dev_id]
+            mem_gb = info.get("totalGlobalMemGB")
+            cc_major = info.get("computeMajor")
+            cc_minor = info.get("computeMinor")
+            cc = f"{cc_major}.{cc_minor}" if cc_major is not None and cc_minor is not None else "-"
+            dev_table.add_row(
+                str(dev_id),
+                str(info.get("name", "Unknown")),
+                f"{mem_gb:.1f}" if isinstance(mem_gb, (int, float)) else "-",
+                cc,
+                str(info.get("numSms", "-")),
+                str(info.get("warpSize", "-")),
+            )
+        console.print(dev_table)
+
+
+def _build_section_comm_table(
+    title: str,
+    rows: list[dict],
+    ttotal_us: float,
+    nbatches: int,
+    footer_label: str,
+    footer_dur_us: float,
+) -> Table:
+    """Build section breakdown table with NCCL communication overlap columns."""
+    footer_pct_total = f"{100 * footer_dur_us / ttotal_us:.2f}%" if ttotal_us > 0 else "—"
+    footer_ms = f"{footer_dur_us / nbatches / 1e3:.2f}" if nbatches > 0 else "—"
+
+    t = Table(
+        title=f"[bold]{title}[/bold]",
+        title_justify="left",
+        box=box.SIMPLE_HEAD,
+        header_style="bold cyan",
+        show_footer=True,
+    )
+    t.add_column("Section", style="bold", footer=f"[dim]{footer_label}[/dim]")
+    t.add_column("Duration (s)", justify="right", footer=f"[dim]{footer_dur_us / 1e6:.3f}[/dim]")
+    t.add_column("Per batch (ms)", justify="right", footer=f"[dim]{footer_ms}[/dim]")
+    t.add_column("% of Total", justify="right", footer=f"[dim]{footer_pct_total}[/dim]")
+    t.add_column("Comm (s)", justify="right", footer="")
+    t.add_column("Comm % Section", justify="right", footer="")
+    t.add_column("Comm % Total", justify="right", footer="")
+
+    for r in rows:
+        dur_us = float(r["dur_us"])
+        comm_us = float(r.get("comm_us", 0.0))
+        pct_total = f"{100 * dur_us / ttotal_us:.2f}%" if ttotal_us > 0 else "—"
+        per_batch_ms = f"{dur_us / nbatches / 1e3:.2f}" if nbatches > 0 else "—"
+        comm_pct_section = f"{100 * comm_us / dur_us:.2f}%" if dur_us > 0 else "—"
+        comm_pct_total = f"{100 * comm_us / ttotal_us:.2f}%" if ttotal_us > 0 else "—"
+        t.add_row(
+            r["label"],
+            f"{dur_us / 1e6:.3f}",
+            per_batch_ms,
+            pct_total,
+            f"{comm_us / 1e6:.3f}",
+            comm_pct_section,
+            comm_pct_total,
+        )
+    return t
+
+
 # ── Plot helpers ───────────────────────────────────────────────────────────────
 def _plot_time_breakdowns(
     fwd_bwd_data: Optional[tuple],
@@ -491,14 +736,20 @@ def _plot_time_breakdowns(
 
         _suptitle(fig, nbatches, ttotal_recorded)
 
-        for idx, (ax, (labels, values), panel) in enumerate(zip(axes, charts, panel_labels)):
+        for idx, (ax, chart, panel) in enumerate(zip(axes, charts, panel_labels)):
+            if len(chart) == 3:
+                labels, values, comm_pcts = chart
+            else:
+                labels, values = chart
+                comm_pcts = [None] * len(labels)
+
             colors = _PALETTES[idx % len(_PALETTES)]
-            triples = [(l, v, c) for l, v, c in zip(labels, values, colors) if v > 0]
+            triples = [(l, v, c, cp) for l, v, c, cp in zip(labels, values, colors, comm_pcts) if v > 0]
             if not triples:
                 ax.set_visible(False)
                 continue
 
-            f_labels, f_values, f_colors = zip(*triples)
+            f_labels, f_values, f_colors, f_comm_pcts = zip(*triples)
             total_val = sum(f_values)
 
             wedges, _, autotexts = ax.pie(
@@ -517,10 +768,12 @@ def _plot_time_breakdowns(
             ax.text(-1.35, 1.15, panel, transform=ax.transData,
                     fontsize=9, fontweight="bold", color=_TEXT_COLOR, va="top")
 
-            legend_entries = [
-                f"{l}  {v / 1e6:.3f} s  ({100 * v / total_val:.1f}%)"
-                for l, v in zip(f_labels, f_values)
-            ]
+            legend_entries = []
+            for l, v, cp in zip(f_labels, f_values, f_comm_pcts):
+                comm_txt = f" (incl. {cp:.1f}% comm.)" if cp is not None else ""
+                legend_entries.append(
+                    f"{l} {v / 1e6:.3f} s{comm_txt}"
+                )
             leg = ax.legend(wedges, legend_entries, loc="lower center",
                             bbox_to_anchor=(0.5, -0.34), ncol=1, frameon=False,
                             labelcolor=_TEXT_COLOR, fontsize=7.5,
@@ -543,7 +796,7 @@ def _plot_gpu_time_breakdown(
     savepath: str = "",
 ) -> None:
     """Plot a publication-quality bar chart for the GPU time breakdown."""
-    COLORS = ["#4878CF", "#D65F5F", "#6ACC65", "#E49444", "#B8B8B8"]
+    colors = _PALETTES[-1 % len(_PALETTES)]
     values_s = [t / 1e6 for t in times_us]
     max_val = max(values_s, default=1)
 
@@ -552,7 +805,7 @@ def _plot_gpu_time_breakdown(
         _suptitle(fig, nbatches, ttotal)
 
         bars = ax.bar(range(len(labels)), values_s,
-                      color=COLORS[:len(labels)], edgecolor="white", linewidth=0.8)
+                      color=colors[:len(labels)], edgecolor="white", linewidth=0.8)
 
         for rect, val in zip(bars, values_s):
             cx = rect.get_x() + rect.get_width() / 2
@@ -589,14 +842,31 @@ def total_time_breakdown(
     console.rule(f"TIME BREAKDOWN — {nbatches} recorded batches")
 
     fwd_bwd_data = enc_dec_data = None
+    ttotal_recorded = float(df["end_time"].max() - df["ts"].min()) if not df.empty else 0.0
+    comm_events = df[df["name"].str.contains("nccl", case=False, na=False)].sort_values("ts")
+    comm_intervals = (
+        merge_overlapping_intervals_df(comm_events[["ts", "end_time"]])
+        if not comm_events.empty
+        else pd.DataFrame(columns=["ts", "end_time"])
+    )
 
-    for chart_idx, (section_title, names_list, chart_labels) in enumerate([
+    for chart_idx, (section_title, names_list, chart_labels, section_patterns) in enumerate([
         ("Forward · Backward · Data loader",
          [["DDPGroupStrategy.training_step"], ["DDPGroupStrategy.backward"], ["train_dataloader_next"]],
-         ["Forward", "Backward", "Data Loader"]),
+         ["Forward", "Backward", "Data Loader"],
+         {
+             "Forward": "DDPGroupStrategy.training_step",
+             "Backward": "DDPGroupStrategy.backward",
+             "Data Loader": "train_dataloader_next",
+         }),
         ("Encoder · Processor · Decoder",
          [["model.encoder"], ["model.processor"], ["model.decoder"]],
-         ["Encoder", "Processor", "Decoder"]),
+         ["Encoder", "Processor", "Decoder"],
+         {
+             "Encoder": "model.encoder",
+             "Processor": "model.processor",
+             "Decoder": "model.decoder",
+         }),
     ]):
         ttotal, tselected_l, _, _, tidle, _ = get_runtime_breakdown(df, names_list=names_list)
         if ttotal <= 0:
@@ -604,7 +874,6 @@ def total_time_breakdown(
             continue
 
         if chart_idx == 0:
-            ttotal_recorded = ttotal
             throughput = nbatches / (ttotal / 1e6)
             console.print(
                 f"\n[bold]Total:[/bold] [yellow]{ttotal / 1e6:.2f} s[/yellow]  "
@@ -612,9 +881,21 @@ def total_time_breakdown(
             )
 
         rows = [{"label": l, "dur_us": float(t)} for l, t in zip(chart_labels, tselected_l)]
-        table = _build_summary_table(
+        rows_with_comm = []
+        for row in rows:
+            pattern = section_patterns.get(row["label"], "")
+            section_events = df[df["name"].str.contains(pattern, regex=True, na=False)].sort_values("ts")
+            section_intervals = (
+                merge_overlapping_intervals_df(section_events[["ts", "end_time"]])
+                if not section_events.empty
+                else pd.DataFrame(columns=["ts", "end_time"])
+            )
+            row["comm_us"] = _interval_overlap_duration(section_intervals, comm_intervals)
+            rows_with_comm.append(row)
+
+        table = _build_section_comm_table(
             title=section_title,
-            rows=rows,
+            rows=rows_with_comm,
             ttotal_us=ttotal,
             nbatches=nbatches,
             footer_label="Elsewhere",
@@ -622,7 +903,15 @@ def total_time_breakdown(
         )
         console.print(table)
 
-        data_tuple = (chart_labels + ["Elsewhere"], [float(t) for t in tselected_l] + [float(tidle)])
+        comm_pcts = [
+            (100 * float(r["comm_us"]) / float(r["dur_us"])) if float(r["dur_us"]) > 0 else 0.0
+            for r in rows_with_comm
+        ]
+        data_tuple = (
+            chart_labels + ["Elsewhere"],
+            [float(t) for t in tselected_l] + [float(tidle)],
+            comm_pcts + [None],
+        )
         if chart_idx == 0:
             fwd_bwd_data = data_tuple
         else:
@@ -630,7 +919,7 @@ def total_time_breakdown(
 
     console.print("[dim]ℹ  Note: not all decoder/encoder/processor sections are instrumented yet.[/dim]\n")
 
-    if plot and (fwd_bwd_data or enc_dec_data):
+    if plot and ttotal_recorded > 0 and (fwd_bwd_data or enc_dec_data):
         _plot_time_breakdowns(fwd_bwd_data, enc_dec_data, nbatches, ttotal_recorded, savepath)
 
     return df
@@ -747,8 +1036,29 @@ def get_detailed_breakdown(
         console.print(f"[yellow]⚠  No {label} annotations found for section '{section}'[/yellow]")
         return pd.DataFrame()
 
-    ttime_exc_overlap = _merged_duration(df_annotations)
-    ttime_exc_overlap_p = 100 * ttime_exc_overlap / total_wall_time if total_wall_time > 0 else 0.0
+    # Filter to leaf-only annotations.
+    # Annotation names have the form "anemoi-<Class>-<module.path>.forward/.backward".
+    # The class name is irrelevant for hierarchy — only the dot-separated module path
+    # determines parent/child relationships.  A name is a parent if its path is a
+    # strict prefix (followed by ".") of any other path in the set.
+    def _module_path(name: str) -> str:
+        parts = name.split("-", 2)
+        if len(parts) != 3:
+            return name
+        path = parts[2]
+        for sfx in (".forward", ".backward"):
+            if path.endswith(sfx):
+                return path[: -len(sfx)]
+        return path
+
+    all_names = sorted(df_annotations["name"].unique())
+    name_to_path = {n: _module_path(n) for n in all_names}
+    path_set = set(name_to_path.values())
+    leaf_names = [
+        n for n in all_names
+        if not any(p.startswith(name_to_path[n] + ".") for p in path_set if p != name_to_path[n])
+    ]
+    df_annotations = df_annotations[df_annotations["name"].isin(leaf_names)]
 
     df_annotations = runtime_analysis(df_annotations).sort_values(
         ["total time us", "name"], ascending=[False, True]
@@ -758,9 +1068,7 @@ def get_detailed_breakdown(
     console.print()
     console.rule(f"DETAILED {label} BREAKDOWN — {section}")
     console.print(
-        f"\n[bold]Total wall time:[/bold] [yellow]{total_wall_time / 1e6:.3f} s[/yellow]   "
-        f"[bold]Total {label} time (excl. overlap):[/bold] [yellow]{ttime_exc_overlap / 1e6:.3f} s[/yellow]  "
-        f"[yellow]{ttime_exc_overlap_p:.2f}%[/yellow] of wall time\n"
+        f"\n[bold]Total active wall time:[/bold] [yellow]{total_wall_time / 1e6:.3f} s[/yellow]\n"
     )
 
     for suffix, title in [(".forward", "Forward"), (".backward", "Backward")]:
@@ -768,10 +1076,10 @@ def get_detailed_breakdown(
         if df_pass.empty:
             console.print(f"[dim]No {title.lower()} pass annotations found.[/dim]")
             continue
-        ttime = _merged_duration(df[df["name"].isin(df_pass["name"])])
-        ttime_p = 100 * ttime / total_wall_time if total_wall_time > 0 else 0.0
+        ttime_active = _merged_duration(df_section[df_section["name"].isin(df_pass["name"]) & (df_section["cat"] == cat_filter)])
+        ttime_active_p = 100 * ttime_active / total_wall_time if total_wall_time > 0 else 0.0
         console.print(_build_breakdown_table(
-            df_pass, f"Top 10 {title} Pass Contributors", section, ttime, ttime_p
+            df_pass, f"Top 10 {title} Pass Contributors", section, ttime_active, ttime_active_p
         ))
 
     console.print()
@@ -796,424 +1104,424 @@ def find_first_trace_file(dirpath: Union[str, Path]) -> Optional[str]:
     return None
 
 
-def analyze_anemoi_durations(json_file_path: str) -> dict:
-    """Compute total and average durations for anemoi encoder/decoder/processor GPU annotations.
-
-    Parameters
-    ----------
-    json_file_path : str
-        Path to the trace JSON file.
-
-    Returns
-    -------
-    dict
-        Summary with total_duration, average_duration, and count per component.
-    """
-    allowed_names = {"anemoi-encoder", "anemoi-decoder", "anemoi-processor"}
-    durations = defaultdict(list)
-
-    with open(json_file_path, "r") as f:
-        data = json.load(f)
-        events = data.get("traceEvents", data)
-        for event in events:
-            if event.get("cat") == "gpu_user_annotation" and event.get("name") in allowed_names:
-                durations[event["name"]].append(event.get("dur", 0))
-
-    summary = {}
-    for name, dur_list in durations.items():
-        total = sum(dur_list)
-        avg = total / len(dur_list) if dur_list else 0
-        summary[name] = {"total_duration": total, "average_duration": avg, "count": len(dur_list)}
-
-    return summary
-
-
-def classify_kernel(name: str) -> str:
-    """Classify a kernel name into 'memory', 'comms', or 'compute'."""
-    name_lower = name.lower()
-    if "memcpy" in name_lower or "memset" in name_lower:
-        return "memory"
-    if "nccl" in name_lower:
-        return "comms"
-    return "compute"
-
-
-def sum_kernel_durations(kernel_durations: dict) -> list[tuple[str, float]]:
-    """Sort kernel durations by total duration (descending).
-
-    Parameters
-    ----------
-    kernel_durations : dict
-        Mapping of kernel name to total duration.
-
-    Returns
-    -------
-    list[tuple[str, float]]
-        Sorted list of (kernel_name, total_duration).
-    """
-    return sorted(kernel_durations.items(), key=lambda x: x[1], reverse=True)
-
-
-def print_kernel_table(
-    data: list[tuple[str, float]],
-    kernel_counts: dict,
-    kernel_weighted_occupancies: dict,
-    top_n: int = 10,
-    num_iterations: int = 20,
-) -> None:
-    """Print a formatted table of kernel durations and occupancy.
-
-    Parameters
-    ----------
-    data : list[tuple[str, float]]
-        Sorted list of (kernel_name, total_duration_us).
-    kernel_counts : dict
-        Mapping of kernel name to call count.
-    kernel_weighted_occupancies : dict
-        Mapping of kernel name to duration-weighted occupancy.
-    top_n : int
-        Number of top kernels to show individually.
-    num_iterations : int
-        Number of training iterations to average over.
-    """
-    if num_iterations <= 0:
-        LOGGER.warning("num_iterations is %d, skipping kernel table", num_iterations)
-        return
-
-    total_duration_us = sum(duration for _, duration in data) / num_iterations
-
-    data_sorted = sorted(data, key=lambda x: x[1], reverse=True)
-    top_kernels = data_sorted[:top_n]
-    remaining = data_sorted[top_n:]
-
-    rows = []
-    total_count = 0
-    for name, duration_us in top_kernels:
-        count = kernel_counts[name] / num_iterations
-        total_count += count
-        occupancy = kernel_weighted_occupancies[name] / duration_us * 100 if duration_us > 0 else 0.0
-        category = classify_kernel(name)
-        percent = ((duration_us / num_iterations) / total_duration_us) * 100 if total_duration_us > 0 else 0.0
-        rows.append((name, category, duration_us / 1e6 / num_iterations, percent, count, occupancy))
-
-    if remaining:
-        other_duration_us = sum(d for _, d in remaining) / num_iterations
-        other_percent = (other_duration_us / total_duration_us) * 100 if total_duration_us > 0 else 0.0
-        other_count = sum(kernel_counts[name] for name, _ in remaining) / num_iterations
-        total_count += other_count
-        rows.append(("other", "-", other_duration_us / 1e6, other_percent, other_count, 0.0))
-
-    rows.append(
-        ("total (kernels on different streams can overlap)", "-", total_duration_us / 1e6, 100.0, total_count, 0.0)
-    )
-
-    console.print(
-        f"{'Kernel':60} {'Category':10} {'Duration (s)':>15} {'% Time':>10} {'Count':>10} {'% Occupancy':>10}"
-    )
-    console.print("-" * 120)
-    for name, category, duration, percent, count, occupancy in rows:
-        console.print(
-            f"{name[:58]:60} {category:10} {duration:15.2f} {percent:10.2f} {count:10.0f} {occupancy:10.2f}"
-        )
-
-
-def count_iterations(json_file_path: str) -> int:
-    """Count the number of training iterations in a trace file.
-
-    Parameters
-    ----------
-    json_file_path : str
-        Path to the trace JSON file.
-
-    Returns
-    -------
-    int
-        Number of iterations detected.
-    """
-    with open(json_file_path, "r") as f:
-        data = json.load(f)
-        events = data.get("traceEvents", data)
-
-    iteration_count = 0
-    for event in events:
-        if event.get("cat") == "user_annotation" and "transfer_batch_to_device" in event.get("name", ""):
-            iteration_count += 1
-    return iteration_count
-
-
-def compute_av_time_per_iter_and_dl_stalls(
-    iteration_durations_us: list[float],
-    dataloading_stall_durations_us: list[float],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Compute average iteration time and data-loading stall statistics.
-
-    Parameters
-    ----------
-    iteration_durations_us : list[float]
-        Per-iteration durations in microseconds.
-    dataloading_stall_durations_us : list[float]
-        Per-iteration data-loading stall durations in microseconds.
-
-    Returns
-    -------
-    tuple
-        (iteration_durations_s, dataloading_stall_durations_s, dataloading_stall_percentages)
-    """
-    if not iteration_durations_us:
-        LOGGER.warning("No iteration durations found; skipping iteration/stall analysis")
-        return np.array([]), np.array([]), np.array([])
-
-    dataloading_stall_durations_s = np.array(dataloading_stall_durations_us) / 1e6
-    iteration_durations_s = np.array(iteration_durations_us) / 1e6
-
-    # Align lengths (take the minimum) and guard against zero-duration iterations
-    min_len = min(len(iteration_durations_s), len(dataloading_stall_durations_s))
-    if min_len > 0:
-        iter_slice = iteration_durations_s[:min_len]
-        stall_slice = dataloading_stall_durations_s[:min_len]
-        # Avoid division by zero for individual iterations
-        with np.errstate(divide="ignore", invalid="ignore"):
-            dataloading_stall_percentages = np.where(
-                iter_slice > 0, stall_slice / iter_slice * 100, 0.0
-            )
-    else:
-        dataloading_stall_percentages = np.array([])
-
-    av_iteration_duration_s = np.median(iteration_durations_s)
-    av_throughput = 1 / av_iteration_duration_s if av_iteration_duration_s > 0 else 0
-    av_dataloading_stall_duration_s = (
-        np.median(dataloading_stall_durations_s) if len(dataloading_stall_durations_s) > 0 else 0
-    )
-    av_dataloading_stall_percentage = (
-        np.median(dataloading_stall_percentages) if len(dataloading_stall_percentages) > 0 else 0
-    )
-
-    console.print(
-        f"Each training iteration took an average of {av_iteration_duration_s:.2f}s "
-        f"({av_throughput:.2f} iterations per second)"
-    )
-    console.print(
-        f"An average of {av_dataloading_stall_duration_s:.2f}s ({av_dataloading_stall_percentage:.2f}%) "
-        f"of each iteration was spent idling while loading data"
-    )
-    if av_dataloading_stall_percentage > 5.0:
-        console.print(
-            "Warning! Dataloading stall times are high. Try increasing the number of dataloader workers. "
-            "If CPU memory is limited, try decreasing prefetch factor to 1 to allow more workers."
-        )
-    return iteration_durations_s, dataloading_stall_durations_s, dataloading_stall_percentages
-
-
-def analyse_HtoD_memcpy(
-    batch_sizes_GB: list[float],
-    batch_transfer_bw_GBs: list[float],
-    batch_transfer_durations_us: list[float],
-) -> tuple[float, float, float]:
-    """Analyse Host-to-Device memory copy performance.
-
-    Parameters
-    ----------
-    batch_sizes_GB : list[float]
-        Batch sizes in GB.
-    batch_transfer_bw_GBs : list[float]
-        Transfer bandwidths in GB/s.
-    batch_transfer_durations_us : list[float]
-        Transfer durations in microseconds.
-
-    Returns
-    -------
-    tuple
-        (av_batch_size_GB, av_batch_transfer_bw_GBs, av_batch_transfer_durations_s)
-    """
-    if not batch_sizes_GB:
-        LOGGER.warning("No HtoD memcpy events found")
-        return 0.0, 0.0, 0.0
-
-    av_batch_size_GB = np.mean(batch_sizes_GB)
-    av_batch_transfer_bw_GBs = np.mean(batch_transfer_bw_GBs)
-    av_batch_transfer_durations_s = np.mean(batch_transfer_durations_us) / 1e6
-    console.print(
-        f"av_batch_size_GB={av_batch_size_GB:.2f}GB, "
-        f"av_batch_transfer_durations_s={av_batch_transfer_durations_s:.2f}s, "
-        f"(av_batch_transfer_bw_GBs={av_batch_transfer_bw_GBs:.2f}GB/s)"
-    )
-    return av_batch_size_GB, av_batch_transfer_bw_GBs, av_batch_transfer_durations_s
-
-
-def parse_json_trace_file(json_file_path: str) -> tuple:
-    """Parse a JSON trace file and extract all key performance metrics in a single pass.
-
-    Parameters
-    ----------
-    json_file_path : str
-        Path to the trace JSON file.
-
-    Returns
-    -------
-    tuple
-        (batch_sizes_GB, batch_transfer_bw_GBs, batch_transfer_durations_us,
-         dataloading_stall_durations_us, iteration_durations_us,
-         kernel_durations, kernel_counts, kernel_weighted_occupancies, iteration_count,
-         df)
-        Where df is the full trace DataFrame (reusable by downstream functions).
-    """
-    with open(json_file_path, "r") as f:
-        data = json.load(f)
-        events = data.get("traceEvents", data)
-
-    # HtoD memcpy analysis
-    batch_sizes_GB = []
-    batch_transfer_bw_GBs = []
-    batch_transfer_durations_us = []
-
-    # Iteration time and dataloading stall analysis
-    dataloading_stall_durations_us = []
-    iteration_durations_us = []
-
-    # Kernel analysis
-    kernel_durations = defaultdict(float)
-    kernel_counts = defaultdict(int)
-    kernel_weighted_occupancies = defaultdict(float)
-
-    # Collect kernel events on the main stream for sorted idle-time calculation
-    main_stream = 7  # assumption
-    main_stream_kernel_times = []
-    iteration_count = 0
-
-    for event in events:
-        cat = event.get("cat", "")
-        name = event.get("name", "")
-        dur = event.get("dur")
-        args = event.get("args", {})
-
-        # Skip events without a valid duration
-        if dur is None:
-            continue
-
-        if cat in ("kernel", "gpu_memcpy", "gpu_memset"):
-            # Normalise kernel name
-            kernel_name = name
-            if kernel_name.startswith("void "):
-                kernel_name = kernel_name[len("void "):]
-            kernel_name = kernel_name.split("<")[0]
-
-            kernel_occupancy_pct = args.get("est. achieved occupancy %", 0) or 0
-            kernel_occupancy_pct /= 100
-
-            kernel_durations[kernel_name] += dur
-            kernel_counts[kernel_name] += 1
-            kernel_weighted_occupancies[kernel_name] += kernel_occupancy_pct * dur
-
-        # Iteration time and dataloading stall time
-        if cat == "user_annotation" and "train_dataloader_next" in name:
-            dataloading_stall_durations_us.append(dur)
-        if cat == "user_annotation" and "run_training_batch" in name:
-            iteration_durations_us.append(dur)
-        if cat == "user_annotation" and "transfer_batch_to_device" in name:
-            iteration_count += 1
-
-        # HtoD memcpy
-        if cat == "gpu_memcpy" and "Memcpy HtoD (Pinned" in name:
-            batch_transfer_durations_us.append(dur)
-            batch_sizes_GB.append(args.get("bytes", 0) / 1e9)
-            batch_transfer_bw_GBs.append(args.get("memory bandwidth (GB/s)", 0))
-
-        # Collect kernel events on main stream for idle time (sort later)
-        if cat == "kernel" and args.get("stream") == main_stream:
-            ts = event.get("ts", 0)
-            main_stream_kernel_times.append((ts, ts + dur))
-
-    # Sort by start time before computing idle gaps
-    main_stream_kernel_times.sort(key=lambda x: x[0])
-    gpu_idle_time = 0
-    prev_kernel_end_time = 0
-    for kernel_start_time, kernel_end_time in main_stream_kernel_times:
-        if prev_kernel_end_time != 0:
-            diff = kernel_start_time - prev_kernel_end_time
-            if diff > 0:
-                gpu_idle_time += diff
-        prev_kernel_end_time = kernel_end_time
-
-    console.print(f"gpu_idle_time = {gpu_idle_time / 1e6}s")
-    if iteration_count > 0:
-        console.print(f"gpu_idle_time per iteration = {gpu_idle_time / 1e6 / iteration_count}s")
-    else:
-        console.print("gpu_idle_time per iteration = N/A (no iterations detected)")
-
-    # Build a DataFrame from the raw events so downstream functions don't re-parse
-    cols = ["cat", "name", "ts", "dur"]
-    df_events = []
-    for event in events:
-        row = {k: event.get(k) for k in cols}
-        if row.get("dur") is not None:
-            df_events.append(row)
-    df = pd.DataFrame(df_events)
-    if not df.empty:
-        df["end_time"] = df["ts"] + df["dur"]
-        if "distributedInfo" in data:
-            df["rank"] = data["distributedInfo"].get("rank")
-        else:
-            df["rank"] = None
-
-    return (
-        batch_sizes_GB,
-        batch_transfer_bw_GBs,
-        batch_transfer_durations_us,
-        dataloading_stall_durations_us,
-        iteration_durations_us,
-        kernel_durations,
-        kernel_counts,
-        kernel_weighted_occupancies,
-        iteration_count,
-        df,
-    )
-
-
-def analyse_gpu_memory_usage(device: int = 0) -> None:
-    """Analyse and report GPU memory usage for the given device.
-
-    Parameters
-    ----------
-    device : int
-        CUDA device index.
-    """
-    try:
-        import torch
-    except ImportError:
-        LOGGER.warning("PyTorch not available; skipping GPU memory analysis")
-        return
-
-    if not torch.cuda.is_available():
-        LOGGER.warning("CUDA not available; skipping GPU memory analysis")
-        return
-
-    props = torch.cuda.get_device_properties(device)
-    max_available_memory_GB = props.total_memory / 1024 / 1024 / 1024
-    max_reserved_memory_GB = torch.cuda.max_memory_reserved(device) / 1024 / 1024 / 1024
-    max_allocated_memory_GB = torch.cuda.max_memory_allocated(device) / 1024 / 1024 / 1024
-    console.print(
-        f"max_available_memory_GB={max_available_memory_GB:.2f}, "
-        f"max_reserved_memory_GB={max_reserved_memory_GB:.2f}, "
-        f"max_allocated_memory_GB={max_allocated_memory_GB:.2f}"
-    )
-
-    max_reserved_but_unused_memory_GB = max_reserved_memory_GB - max_allocated_memory_GB
-    if max_reserved_but_unused_memory_GB > 2:
-        console.print(
-            f"Warning! You have {max_reserved_but_unused_memory_GB:.2f}GB of memory reserved by PyTorch but not "
-            f"actively allocated. This memory fragmentation can result in avoidable Out-Of-Memory errors. "
-            f"Try 'export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True' to reduce fragmentation."
-        )
-
-    max_allocated_memory_percentage = (
-        max_allocated_memory_GB / max_available_memory_GB * 100 if max_available_memory_GB > 0 else 0
-    )
-    console.print(f"Peak (allocated) memory usage was {max_allocated_memory_percentage:.2f}% of total device memory")
-    if max_allocated_memory_percentage < 50.0:
-        console.print(
-            "Warning! Your peak device memory usage is low. "
-            "You could try increasing the batch size or reducing the number of GPUs."
-        )
+#def analyze_anemoi_durations(json_file_path: str) -> dict:
+    #"""Compute total and average durations for anemoi encoder/decoder/processor GPU annotations.
+
+    #Parameters
+    #----------
+    #json_file_path : str
+        #Path to the trace JSON file.
+
+    #Returns
+    #-------
+    #dict
+        #Summary with total_duration, average_duration, and count per component.
+    #"""
+    #allowed_names = {"anemoi-encoder", "anemoi-decoder", "anemoi-processor"}
+    #durations = defaultdict(list)
+
+    #with open(json_file_path, "r") as f:
+        #data = json.load(f)
+        #events = data.get("traceEvents", data)
+        #for event in events:
+            #if event.get("cat") == "gpu_user_annotation" and event.get("name") in allowed_names:
+                #durations[event["name"]].append(event.get("dur", 0))
+
+    #summary = {}
+    #for name, dur_list in durations.items():
+        #total = sum(dur_list)
+        #avg = total / len(dur_list) if dur_list else 0
+        #summary[name] = {"total_duration": total, "average_duration": avg, "count": len(dur_list)}
+
+    #return summary
+
+
+#def classify_kernel(name: str) -> str:
+    #"""Classify a kernel name into 'memory', 'comms', or 'compute'."""
+    #name_lower = name.lower()
+    #if "memcpy" in name_lower or "memset" in name_lower:
+        #return "memory"
+    #if "nccl" in name_lower:
+        #return "comms"
+    #return "compute"
+
+
+#def sum_kernel_durations(kernel_durations: dict) -> list[tuple[str, float]]:
+    #"""Sort kernel durations by total duration (descending).
+
+    #Parameters
+    #----------
+    #kernel_durations : dict
+        #Mapping of kernel name to total duration.
+
+    #Returns
+    #-------
+    #list[tuple[str, float]]
+        #Sorted list of (kernel_name, total_duration).
+    #"""
+    #return sorted(kernel_durations.items(), key=lambda x: x[1], reverse=True)
+
+
+#def print_kernel_table(
+    #data: list[tuple[str, float]],
+    #kernel_counts: dict,
+    #kernel_weighted_occupancies: dict,
+    #top_n: int = 10,
+    #num_iterations: int = 20,
+#) -> None:
+    #"""Print a formatted table of kernel durations and occupancy.
+
+    #Parameters
+    #----------
+    #data : list[tuple[str, float]]
+        #Sorted list of (kernel_name, total_duration_us).
+    #kernel_counts : dict
+        #Mapping of kernel name to call count.
+    #kernel_weighted_occupancies : dict
+        #Mapping of kernel name to duration-weighted occupancy.
+    #top_n : int
+        #Number of top kernels to show individually.
+    #num_iterations : int
+        #Number of training iterations to average over.
+    #"""
+    #if num_iterations <= 0:
+        #LOGGER.warning("num_iterations is %d, skipping kernel table", num_iterations)
+        #return
+
+    #total_duration_us = sum(duration for _, duration in data) / num_iterations
+
+    #data_sorted = sorted(data, key=lambda x: x[1], reverse=True)
+    #top_kernels = data_sorted[:top_n]
+    #remaining = data_sorted[top_n:]
+
+    #rows = []
+    #total_count = 0
+    #for name, duration_us in top_kernels:
+        #count = kernel_counts[name] / num_iterations
+        #total_count += count
+        #occupancy = kernel_weighted_occupancies[name] / duration_us * 100 if duration_us > 0 else 0.0
+        #category = classify_kernel(name)
+        #percent = ((duration_us / num_iterations) / total_duration_us) * 100 if total_duration_us > 0 else 0.0
+        #rows.append((name, category, duration_us / 1e6 / num_iterations, percent, count, occupancy))
+
+    #if remaining:
+        #other_duration_us = sum(d for _, d in remaining) / num_iterations
+        #other_percent = (other_duration_us / total_duration_us) * 100 if total_duration_us > 0 else 0.0
+        #other_count = sum(kernel_counts[name] for name, _ in remaining) / num_iterations
+        #total_count += other_count
+        #rows.append(("other", "-", other_duration_us / 1e6, other_percent, other_count, 0.0))
+
+    #rows.append(
+        #("total (kernels on different streams can overlap)", "-", total_duration_us / 1e6, 100.0, total_count, 0.0)
+    #)
+
+    #console.print(
+        #f"{'Kernel':60} {'Category':10} {'Duration (s)':>15} {'% Time':>10} {'Count':>10} {'% Occupancy':>10}"
+    #)
+    #console.print("-" * 120)
+    #for name, category, duration, percent, count, occupancy in rows:
+        #console.print(
+            #f"{name[:58]:60} {category:10} {duration:15.2f} {percent:10.2f} {count:10.0f} {occupancy:10.2f}"
+        #)
+
+
+#def count_iterations(json_file_path: str) -> int:
+    #"""Count the number of training iterations in a trace file.
+
+    #Parameters
+    #----------
+    #json_file_path : str
+        #Path to the trace JSON file.
+
+    #Returns
+    #-------
+    #int
+        #Number of iterations detected.
+    #"""
+    #with open(json_file_path, "r") as f:
+        #data = json.load(f)
+        #events = data.get("traceEvents", data)
+
+    #iteration_count = 0
+    #for event in events:
+        #if event.get("cat") == "user_annotation" and "transfer_batch_to_device" in event.get("name", ""):
+            #iteration_count += 1
+    #return iteration_count
+
+
+#def compute_av_time_per_iter_and_dl_stalls(
+    #iteration_durations_us: list[float],
+    #dataloading_stall_durations_us: list[float],
+#) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    #"""Compute average iteration time and data-loading stall statistics.
+
+    #Parameters
+    #----------
+    #iteration_durations_us : list[float]
+        #Per-iteration durations in microseconds.
+    #dataloading_stall_durations_us : list[float]
+        #Per-iteration data-loading stall durations in microseconds.
+
+    #Returns
+    #-------
+    #tuple
+        #(iteration_durations_s, dataloading_stall_durations_s, dataloading_stall_percentages)
+    #"""
+    #if not iteration_durations_us:
+        #LOGGER.warning("No iteration durations found; skipping iteration/stall analysis")
+        #return np.array([]), np.array([]), np.array([])
+
+    #dataloading_stall_durations_s = np.array(dataloading_stall_durations_us) / 1e6
+    #iteration_durations_s = np.array(iteration_durations_us) / 1e6
+
+    ## Align lengths (take the minimum) and guard against zero-duration iterations
+    #min_len = min(len(iteration_durations_s), len(dataloading_stall_durations_s))
+    #if min_len > 0:
+        #iter_slice = iteration_durations_s[:min_len]
+        #stall_slice = dataloading_stall_durations_s[:min_len]
+        ## Avoid division by zero for individual iterations
+        #with np.errstate(divide="ignore", invalid="ignore"):
+            #dataloading_stall_percentages = np.where(
+                #iter_slice > 0, stall_slice / iter_slice * 100, 0.0
+            #)
+    #else:
+        #dataloading_stall_percentages = np.array([])
+
+    #av_iteration_duration_s = np.median(iteration_durations_s)
+    #av_throughput = 1 / av_iteration_duration_s if av_iteration_duration_s > 0 else 0
+    #av_dataloading_stall_duration_s = (
+        #np.median(dataloading_stall_durations_s) if len(dataloading_stall_durations_s) > 0 else 0
+    #)
+    #av_dataloading_stall_percentage = (
+        #np.median(dataloading_stall_percentages) if len(dataloading_stall_percentages) > 0 else 0
+    #)
+
+    #console.print(
+        #f"Each training iteration took an average of {av_iteration_duration_s:.2f}s "
+        #f"({av_throughput:.2f} iterations per second)"
+    #)
+    #console.print(
+        #f"An average of {av_dataloading_stall_duration_s:.2f}s ({av_dataloading_stall_percentage:.2f}%) "
+        #f"of each iteration was spent idling while loading data"
+    #)
+    #if av_dataloading_stall_percentage > 5.0:
+        #console.print(
+            #"Warning! Dataloading stall times are high. Try increasing the number of dataloader workers. "
+            #"If CPU memory is limited, try decreasing prefetch factor to 1 to allow more workers."
+        #)
+    #return iteration_durations_s, dataloading_stall_durations_s, dataloading_stall_percentages
+
+
+#def analyse_HtoD_memcpy(
+    #batch_sizes_GB: list[float],
+    #batch_transfer_bw_GBs: list[float],
+    #batch_transfer_durations_us: list[float],
+#) -> tuple[float, float, float]:
+    #"""Analyse Host-to-Device memory copy performance.
+
+    #Parameters
+    #----------
+    #batch_sizes_GB : list[float]
+        #Batch sizes in GB.
+    #batch_transfer_bw_GBs : list[float]
+        #Transfer bandwidths in GB/s.
+    #batch_transfer_durations_us : list[float]
+        #Transfer durations in microseconds.
+
+    #Returns
+    #-------
+    #tuple
+        #(av_batch_size_GB, av_batch_transfer_bw_GBs, av_batch_transfer_durations_s)
+    #"""
+    #if not batch_sizes_GB:
+        #LOGGER.warning("No HtoD memcpy events found")
+        #return 0.0, 0.0, 0.0
+
+    #av_batch_size_GB = np.mean(batch_sizes_GB)
+    #av_batch_transfer_bw_GBs = np.mean(batch_transfer_bw_GBs)
+    #av_batch_transfer_durations_s = np.mean(batch_transfer_durations_us) / 1e6
+    #console.print(
+        #f"av_batch_size_GB={av_batch_size_GB:.2f}GB, "
+        #f"av_batch_transfer_durations_s={av_batch_transfer_durations_s:.2f}s, "
+        #f"(av_batch_transfer_bw_GBs={av_batch_transfer_bw_GBs:.2f}GB/s)"
+    #)
+    #return av_batch_size_GB, av_batch_transfer_bw_GBs, av_batch_transfer_durations_s
+
+
+#def parse_json_trace_file(json_file_path: str) -> tuple:
+    #"""Parse a JSON trace file and extract all key performance metrics in a single pass.
+
+    #Parameters
+    #----------
+    #json_file_path : str
+        #Path to the trace JSON file.
+
+    #Returns
+    #-------
+    #tuple
+        #(batch_sizes_GB, batch_transfer_bw_GBs, batch_transfer_durations_us,
+         #dataloading_stall_durations_us, iteration_durations_us,
+         #kernel_durations, kernel_counts, kernel_weighted_occupancies, iteration_count,
+         #df)
+        #Where df is the full trace DataFrame (reusable by downstream functions).
+    #"""
+    #with open(json_file_path, "r") as f:
+        #data = json.load(f)
+        #events = data.get("traceEvents", data)
+
+    ## HtoD memcpy analysis
+    #batch_sizes_GB = []
+    #batch_transfer_bw_GBs = []
+    #batch_transfer_durations_us = []
+
+    ## Iteration time and dataloading stall analysis
+    #dataloading_stall_durations_us = []
+    #iteration_durations_us = []
+
+    ## Kernel analysis
+    #kernel_durations = defaultdict(float)
+    #kernel_counts = defaultdict(int)
+    #kernel_weighted_occupancies = defaultdict(float)
+
+    ## Collect kernel events on the main stream for sorted idle-time calculation
+    #main_stream = 7  # assumption
+    #main_stream_kernel_times = []
+    #iteration_count = 0
+
+    #for event in events:
+        #cat = event.get("cat", "")
+        #name = event.get("name", "")
+        #dur = event.get("dur")
+        #args = event.get("args", {})
+
+        ## Skip events without a valid duration
+        #if dur is None:
+            #continue
+
+        #if cat in ("kernel", "gpu_memcpy", "gpu_memset"):
+            ## Normalise kernel name
+            #kernel_name = name
+            #if kernel_name.startswith("void "):
+                #kernel_name = kernel_name[len("void "):]
+            #kernel_name = kernel_name.split("<")[0]
+
+            #kernel_occupancy_pct = args.get("est. achieved occupancy %", 0) or 0
+            #kernel_occupancy_pct /= 100
+
+            #kernel_durations[kernel_name] += dur
+            #kernel_counts[kernel_name] += 1
+            #kernel_weighted_occupancies[kernel_name] += kernel_occupancy_pct * dur
+
+        ## Iteration time and dataloading stall time
+        #if cat == "user_annotation" and "train_dataloader_next" in name:
+            #dataloading_stall_durations_us.append(dur)
+        #if cat == "user_annotation" and "run_training_batch" in name:
+            #iteration_durations_us.append(dur)
+        #if cat == "user_annotation" and "transfer_batch_to_device" in name:
+            #iteration_count += 1
+
+        ## HtoD memcpy
+        #if cat == "gpu_memcpy" and "Memcpy HtoD (Pinned" in name:
+            #batch_transfer_durations_us.append(dur)
+            #batch_sizes_GB.append(args.get("bytes", 0) / 1e9)
+            #batch_transfer_bw_GBs.append(args.get("memory bandwidth (GB/s)", 0))
+
+        ## Collect kernel events on main stream for idle time (sort later)
+        #if cat == "kernel" and args.get("stream") == main_stream:
+            #ts = event.get("ts", 0)
+            #main_stream_kernel_times.append((ts, ts + dur))
+
+    ## Sort by start time before computing idle gaps
+    #main_stream_kernel_times.sort(key=lambda x: x[0])
+    #gpu_idle_time = 0
+    #prev_kernel_end_time = 0
+    #for kernel_start_time, kernel_end_time in main_stream_kernel_times:
+        #if prev_kernel_end_time != 0:
+            #diff = kernel_start_time - prev_kernel_end_time
+            #if diff > 0:
+                #gpu_idle_time += diff
+        #prev_kernel_end_time = kernel_end_time
+
+    #console.print(f"gpu_idle_time = {gpu_idle_time / 1e6}s")
+    #if iteration_count > 0:
+        #console.print(f"gpu_idle_time per iteration = {gpu_idle_time / 1e6 / iteration_count}s")
+    #else:
+        #console.print("gpu_idle_time per iteration = N/A (no iterations detected)")
+
+    ## Build a DataFrame from the raw events so downstream functions don't re-parse
+    #cols = ["cat", "name", "ts", "dur"]
+    #df_events = []
+    #for event in events:
+        #row = {k: event.get(k) for k in cols}
+        #if row.get("dur") is not None:
+            #df_events.append(row)
+    #df = pd.DataFrame(df_events)
+    #if not df.empty:
+        #df["end_time"] = df["ts"] + df["dur"]
+        #if "distributedInfo" in data:
+            #df["rank"] = data["distributedInfo"].get("rank")
+        #else:
+            #df["rank"] = None
+
+    #return (
+        #batch_sizes_GB,
+        #batch_transfer_bw_GBs,
+        #batch_transfer_durations_us,
+        #dataloading_stall_durations_us,
+        #iteration_durations_us,
+        #kernel_durations,
+        #kernel_counts,
+        #kernel_weighted_occupancies,
+        #iteration_count,
+        #df,
+    #)
+
+
+#def analyse_gpu_memory_usage(device: int = 0) -> None:
+    #"""Analyse and report GPU memory usage for the given device.
+
+    #Parameters
+    #----------
+    #device : int
+        #CUDA device index.
+    #"""
+    #try:
+        #import torch
+    #except ImportError:
+        #LOGGER.warning("PyTorch not available; skipping GPU memory analysis")
+        #return
+
+    #if not torch.cuda.is_available():
+        #LOGGER.warning("CUDA not available; skipping GPU memory analysis")
+        #return
+
+    #props = torch.cuda.get_device_properties(device)
+    #max_available_memory_GB = props.total_memory / 1024 / 1024 / 1024
+    #max_reserved_memory_GB = torch.cuda.max_memory_reserved(device) / 1024 / 1024 / 1024
+    #max_allocated_memory_GB = torch.cuda.max_memory_allocated(device) / 1024 / 1024 / 1024
+    #console.print(
+        #f"max_available_memory_GB={max_available_memory_GB:.2f}, "
+        #f"max_reserved_memory_GB={max_reserved_memory_GB:.2f}, "
+        #f"max_allocated_memory_GB={max_allocated_memory_GB:.2f}"
+    #)
+
+    #max_reserved_but_unused_memory_GB = max_reserved_memory_GB - max_allocated_memory_GB
+    #if max_reserved_but_unused_memory_GB > 2:
+        #console.print(
+            #f"Warning! You have {max_reserved_but_unused_memory_GB:.2f}GB of memory reserved by PyTorch but not "
+            #f"actively allocated. This memory fragmentation can result in avoidable Out-Of-Memory errors. "
+            #f"Try 'export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True' to reduce fragmentation."
+        #)
+
+    #max_allocated_memory_percentage = (
+        #max_allocated_memory_GB / max_available_memory_GB * 100 if max_available_memory_GB > 0 else 0
+    #)
+    #console.print(f"Peak (allocated) memory usage was {max_allocated_memory_percentage:.2f}% of total device memory")
+    #if max_allocated_memory_percentage < 50.0:
+        #console.print(
+            #"Warning! Your peak device memory usage is low. "
+            #"You could try increasing the batch size or reducing the number of GPUs."
+        #)
 
 
 def analyse_trace(dirpath: Union[str, Path], device: int = 0) -> None:
@@ -1257,6 +1565,7 @@ def analyse_trace(dirpath: Union[str, Path], device: int = 0) -> None:
     #analyse_gpu_memory_usage(device=device)
 
     df = trace_to_dataframe(filename)
+    print_trace_metadata(df)
     console.print("\n")
     total_time_breakdown(df)
     console.print("\n")
@@ -1284,3 +1593,4 @@ if __name__ == "__main__":
         # Single file: wrap its parent directory logic or analyse directly
         dirpath = os.path.dirname(target) or "."
         analyse_trace(dirpath)
+
