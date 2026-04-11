@@ -98,6 +98,7 @@ class AnemoiProfiler(AnemoiTrainer):
         if memory_metrics_df is not None:
             #warnings.warn("INFO: Memory Report metrics represent metrics aggregated across all nodes")
             #self.print_report("Memory Profiling", memory_metrics_df, color="purple", emoji="floppy_disk")
+            console.print("[bold purple]Detailed Profiling [/bold purple]", ":microscope:")
             trace_cfg = self.config.diagnostics.benchmark_profiler.trace_analyser
             analyse_trace(
                 self.profiler.dirpath,

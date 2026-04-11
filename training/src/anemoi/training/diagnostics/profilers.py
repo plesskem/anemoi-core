@@ -336,6 +336,46 @@ class BenchmarkProfiler(Profiler):
             )
 
     def _create_memory_profilers(self) -> None:
+        """
+        Initialize PyTorch Lightning memory profilers for distributed training.
+
+        This method sets up profilers to track GPU and CPU memory usage and performance metrics
+        during training. It uses PyTorch's Kineto profiler to generate Chrome trace files that
+        can be analyzed with trace_analyser.
+
+        The profiler is only enabled if `config.diagnostics.benchmark_profiler.memory.enabled` is True.
+
+        Conditionally enabled based on:
+        - `trace_rank0_only`: If True, profiling only occurs on rank 0 process in distributed training.
+            If False, all processes generate their own trace files.
+
+        Generated trace files are named: `{hostname}_{process_id}.{stage}.{timestamp_ns}.pt.trace.json`
+        These JSON traces can be opened in Chrome's chrome://tracing viewer or analyzed by trace_analyser.
+
+        Profiler Configuration:
+                activities: Tracks both CUDA and CPU execution
+                with_stack: Disabled to prevent failures on aarch64 systems and reduce trace length
+                emit_nvtx: NVIDIA Tools Extension events disabled
+                export_to_chrome: Enables Chrome trace format export (json)
+                record_shapes: Tensor shape recording disabled for performance
+                group_by_input_shapes: Shape-based grouping disabled
+                schedule: Controls profiling lifecycle with parameters:
+                        - wait: Steps before profiling starts
+                        - warmup: Initial steps excluded from analysis (skips KernelLaunches overhead)
+                        - active: Number of steps to profile
+                        - repeat: Number of profiling cycles
+                        - skip_first: Skips initial sanity validation steps
+
+        Trace Output Attributes (for interpretation in trace_analyser):
+                - dur: Duration of operations in microseconds
+                - ts: Timestamp in microseconds since profiling start
+                - name: Operation/kernel name
+                - args: Operation metadata (tensor shapes, etc. if record_shapes enabled)
+                - cat: Category (e.g., 'cpu_op', 'gpu_op', 'python_function')
+                - ph: Event type ('X' for complete events, 'M' for metadata)
+                
+        The torch.profiler.profile class is patched to serialize distributed training information.
+        """
         if self.config.diagnostics.benchmark_profiler.memory.enabled:
             import os
 
@@ -344,7 +384,6 @@ class BenchmarkProfiler(Profiler):
                 def handler_fn(prof: pl.profilers.Profiler) -> None:
                     import socket
                     import time
-
                     worker_name = f"{socket.gethostname()}_{os.getpid()}"
                     file_name = str(dir_name / f"{worker_name}.{stage}.{time.time_ns()}.pt.trace.json")
                     LOGGER.info("Saving pytorch lightning profiler trace to %s", file_name)
@@ -373,13 +412,15 @@ class BenchmarkProfiler(Profiler):
                     dirpath=self.dirpath,
                     on_trace_ready=trace_handler(self.dirpath),
                     schedule=torch.profiler.schedule(
+                        skip_first_wait=self.config.diagnostics.benchmark_profiler.memory.skip_first_wait,  # don't double-wait at start
                         wait=self.config.diagnostics.benchmark_profiler.memory.wait,
                         warmup=self.warmup,
                         active=self.num_steps,
-                        repeat=1,
+                        repeat=self.config.diagnostics.benchmark_profiler.memory.repeat,
                         skip_first=self.config.training.num_sanity_val_steps,
                     ),
                 )
+                LOGGER.info(f"Memory profiler init with skip_first_wait={self.config.diagnostics.benchmark_profiler.memory.skip_first_wait}, wait={self.config.diagnostics.benchmark_profiler.memory.wait}, warmup={self.warmup}, active={self.num_steps} and repeat={self.config.diagnostics.benchmark_profiler.memory.repeat}")
         self.time_rows_dict = None  # updated if we create a memory profile report
 
     def start(self, action_name: str) -> None:
@@ -407,8 +448,11 @@ class BenchmarkProfiler(Profiler):
     def _trim_time_report(self, recorded_actions: dict) -> dict[str, float]:
         all_actions_names = recorded_actions.keys()
         df = pd.DataFrame({"Strings": all_actions_names})
-        combined_pattern = "|".join(PROFILER_ACTIONS)
-        filtered_df = df[df["Strings"].str.contains(combined_pattern, regex=True, na=False)]
+
+        def _matches_profiler_action(name: str) -> bool:
+            return any(re.search(pattern, name) for pattern in PROFILER_ACTIONS)
+
+        filtered_df = df[df["Strings"].apply(lambda name: _matches_profiler_action(name) if isinstance(name, str) else False)]
         trimmed_actions_names = filtered_df["Strings"].tolist()
         return {key: recorded_actions[key] for key in trimmed_actions_names}
 

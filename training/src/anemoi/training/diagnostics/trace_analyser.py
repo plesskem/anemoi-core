@@ -7,6 +7,7 @@ runtime analysis.
 """
 
 import argparse
+from cProfile import label
 import json
 import logging
 import os
@@ -854,9 +855,6 @@ def total_time_breakdown(
     df = _load_df(tracefile_or_df)
     nbatches, mean_batch_us, throughput, total_batch_us = _batch_stats(df)
 
-    console.print()
-    console.rule(f"TIME BREAKDOWN — {nbatches} recorded batches")
-
     fwd_bwd_data = enc_dec_data = None
     ttotal_recorded = float(df["end_time"].max() - df["ts"].min()) if not df.empty else 0.0
     comm_events = df[df["name"].str.contains("nccl", case=False, na=False)].sort_values("ts")
@@ -966,8 +964,6 @@ def gpu_time_breakdown(
     ttotal = float(df["end_time"].max() - df["ts"].min())
     nbatches, mean_batch_us, throughput, _ = _batch_stats(df)
 
-    console.print()
-    console.rule(f"GPU TIME BREAKDOWN — {nbatches} recorded batches")
     console.print(
         f"\n[bold]Total:[/bold] [yellow]{ttotal / 1e6:.3f} s[/yellow]  "
         f"[bold]Throughput:[/bold] [yellow]{throughput:.2f} it/s[/yellow]  "
@@ -1012,7 +1008,7 @@ def gpu_time_breakdown(
 
     if ttotal > 0:
         console.print(
-            f"[dim]GPU Idle: {gpu_idle / 1e6:.3f} s ({100 * gpu_idle / ttotal:.2f}%)[/dim]"
+            f"GPU Idle: [yellow] {gpu_idle / 1e6:.3f} s ({100 * gpu_idle / ttotal:.2f}%)[/yellow]"
         )
     console.print("[dim]ℹ  Sections overlap across streams — percentages may sum to >100%.[/dim]\n")
 
@@ -1098,8 +1094,6 @@ def get_detailed_breakdown(
     )
     df_annotations["total time sec"] = df_annotations["total time us"] / 1e6
 
-    console.print()
-    console.rule(f"DETAILED {label} BREAKDOWN — {section}")
     console.print(
         f"\n[bold]Total active wall time:[/bold] [yellow]{total_wall_time / 1e6:.3f} s[/yellow]\n"
     )
@@ -1724,15 +1718,17 @@ def analyse_trace(
         If True, print detailed breakdown tables for each selected trace after
         the overview and per-trace summary tables.
     """
+    console.print(f"[dim]Analysing trace files in {dirpath}[/dim]\n")
     trace_files = find_trace_files(dirpath)
-    console.print(f"Analysing Traces in {dirpath}")
     if not trace_files:
         LOGGER.warning("No trace file found in %s", dirpath)
         return
 
     selected_trace_files = trace_files
     if max_ranks is not None and max_ranks >= 0:
-        selected_trace_files = selected_trace_files[: max_ranks]
+        selected_trace_files = selected_trace_files[:max_ranks]
+    else:
+        max_ranks = len(selected_trace_files)  # if -1 or None, include all ranks
 
     summaries = []
     selected_rows = []
@@ -1743,42 +1739,70 @@ def analyse_trace(
         if rank is None and index == 0:
             rank = 0
             summary["rank"] = 0
-
         summary["trace_file"] = trace_file
         summaries.append(summary)
         selected_rows.append((rank, trace_file))
 
-    console.print(f"Analysing {len(selected_trace_files)} trace files in the selected trace set")
+    # ── Top-level analysis header ─────────────────────────────────────────────
+    nranks = len(selected_trace_files)
+    nbatches = summaries[0]["nbatches"]
+    console.rule(
+        f"[bold]TRACE ANALYSIS[/bold] of {nranks} rank's · recorded {nbatches} batches\n",
+        align="left",
+    )
     _print_multi_rank_overview(summaries)
 
-    for row_index, (selected_rank, selected_file) in enumerate(selected_rows):
-        if selected_rank is None:
-            selected_rank = row_index
+    # Pre-load all DataFrames once — reused across all section loops.
+    rank_data = []
+    for row_index, (rank, trace_file) in enumerate(selected_rows):
+        if rank is None:
+            rank = row_index
+        df = trace_to_dataframe(trace_file)
+        trace_stem = Path(trace_file).name.replace(".pt.trace.json", "")
+        rank_data.append((rank, trace_file, trace_stem, df))
 
-        console.print(f"Analysing trace file from rank {selected_rank} {selected_file}")
-        df = trace_to_dataframe(selected_file)
+    # ── Metadata ─────────────────────────────────────────────────────────────
+    console.rule("[bold]METADATA[/bold]\n", align="left")
+    for rank, trace_file, _, df in rank_data:
+        console.rule(f"Rank {rank}\n", align="left", style="dim")
         print_trace_metadata(df)
-        console.print("\n")
-        total_time_breakdown(df, plot=plot)
-        console.print("\n")
-        gpu_time_breakdown(df, plot=plot)
-        console.print("\n")
+
+    # ── Total time breakdown ──────────────────────────────────────────────────
+    console.rule("[bold]TIME BREAKDOWN[/bold]\n", align="left")
+    for rank, trace_file, trace_stem, df in rank_data:
+        console.rule(f"Rank {rank}\n", align="left", style="dim")
+        total_plot_path = str(Path(dirpath) / f"{trace_stem}.time_breakdown.png") if plot else ""
+        total_time_breakdown(df, plot=plot, savepath=total_plot_path)
+
+    # ── GPU time breakdown ────────────────────────────────────────────────────
+    console.rule("[bold]GPU TIME BREAKDOWN[/bold]\n", align="left")
+    for rank, trace_file, trace_stem, df in rank_data:
+        console.rule(f"Rank {rank}\n", align="left", style="dim")
+        gpu_plot_path = str(Path(dirpath) / f"{trace_stem}.gpu_time_breakdown.png") if plot else ""
+        gpu_time_breakdown(df, plot=plot, savepath=gpu_plot_path)
 
     if not detailed:
         console.print("[dim]Skipping detailed analysis.[/dim]")
         return
 
-    for row_index, (selected_rank, selected_file) in enumerate(selected_rows):
-        if selected_rank is None:
-            selected_rank = row_index
-        console.print(f"Analysing detailed trace file from rank {selected_rank} {selected_file}")
-        df = trace_to_dataframe(selected_file)
-
+    console.rule(
+        f"[bold]DETAILED TRACE ANALYSIS[/bold] of {nranks} rank's · recorded {nbatches} batches\n",
+        align="left",
+    )
+       # ── Detailed breakdown ────────────────────────────────────────────────────
+    for rank, trace_file, _, df in rank_data:
+        console.rule(f"Rank {rank}\n", align="left", style="dim")
+        console.rule(f"GPU Time — ENCODER - Rank {rank}",  align="left", style='dim yellow')
         get_detailed_breakdown(df, section="model.encoder")
+        console.rule(f"CPU Time — ENCODER - Rank {rank}",  align="left", style='dim yellow')
         get_detailed_breakdown(df, section="model.encoder", gpu=False)
+        console.rule(f"GPU Time — PROCESSOR - Rank {rank}",  align="left", style='dim yellow')
         get_detailed_breakdown(df, section="model.processor")
+        console.rule(f"CPU Time — PROCESSOR - Rank {rank}",  align="left", style='dim yellow')
         get_detailed_breakdown(df, section="model.processor", gpu=False)
+        console.rule(f"GPU Time — DECODER - Rank {rank}",  align="left", style='dim yellow')
         get_detailed_breakdown(df, section="model.decoder")
+        console.rule(f"CPU Time — DECODER - Rank {rank}",  align="left", style='dim yellow')
         get_detailed_breakdown(df, section="model.decoder", gpu=False)
 
 
