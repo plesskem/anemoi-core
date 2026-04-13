@@ -1747,10 +1747,11 @@ def analyse_trace(
     nranks = len(selected_trace_files)
     nbatches = summaries[0]["nbatches"]
     console.rule(
-        f"[bold]TRACE ANALYSIS[/bold] of {nranks} rank's · recorded {nbatches} batches\n",
+        f"[bold]TRACE ANALYSIS[/bold] of {nranks} rank's · recorded {nbatches} batches",
         align="left",
     )
     _print_multi_rank_overview(summaries)
+    console.print("\n")
 
     # Pre-load all DataFrames once — reused across all section loops.
     rank_data = []
@@ -1763,21 +1764,29 @@ def analyse_trace(
 
     # ── Metadata ─────────────────────────────────────────────────────────────
     console.rule("[bold]METADATA[/bold]\n", align="left")
+    console.print("\n")
+
     for rank, trace_file, _, df in rank_data:
         console.rule(f"Rank {rank}\n", align="left", style="dim")
+        console.print("\n")
         print_trace_metadata(df)
 
     # ── Total time breakdown ──────────────────────────────────────────────────
     console.rule("[bold]TIME BREAKDOWN[/bold]\n", align="left")
+    console.print("\n")
+
     for rank, trace_file, trace_stem, df in rank_data:
         console.rule(f"Rank {rank}\n", align="left", style="dim")
+        console.print("\n")
         total_plot_path = str(Path(dirpath) / f"{trace_stem}.time_breakdown.png") if plot else ""
         total_time_breakdown(df, plot=plot, savepath=total_plot_path)
 
     # ── GPU time breakdown ────────────────────────────────────────────────────
     console.rule("[bold]GPU TIME BREAKDOWN[/bold]\n", align="left")
+    console.print("\n")
     for rank, trace_file, trace_stem, df in rank_data:
         console.rule(f"Rank {rank}\n", align="left", style="dim")
+        console.print("\n")
         gpu_plot_path = str(Path(dirpath) / f"{trace_stem}.gpu_time_breakdown.png") if plot else ""
         gpu_time_breakdown(df, plot=plot, savepath=gpu_plot_path)
 
@@ -1789,9 +1798,11 @@ def analyse_trace(
         f"[bold]DETAILED TRACE ANALYSIS[/bold] of {nranks} rank's · recorded {nbatches} batches\n",
         align="left",
     )
+    console.print("\n")
        # ── Detailed breakdown ────────────────────────────────────────────────────
     for rank, trace_file, _, df in rank_data:
         console.rule(f"Rank {rank}\n", align="left", style="dim")
+        console.print("\n")
         console.rule(f"GPU Time — ENCODER - Rank {rank}",  align="left", style='dim yellow')
         get_detailed_breakdown(df, section="model.encoder")
         console.rule(f"CPU Time — ENCODER - Rank {rank}",  align="left", style='dim yellow')
@@ -1820,6 +1831,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Print detailed breakdown tables for each selected trace.",
     )
+    parser.add_argument(
+        "--plot",
+        action="store_true",
+        help="Generate and save breakdown plots for each selected trace.",
+    )
     args = parser.parse_args()
 
     target = args.target
@@ -1828,6 +1844,7 @@ if __name__ == "__main__":
             target,
             max_ranks=args.max_ranks,
             detailed=args.detailed,
+            plot=args.plot,
         )
     else:
         # Single file: wrap its parent directory logic or analyse directly.
@@ -1836,5 +1853,6 @@ if __name__ == "__main__":
             dirpath,
             max_ranks=args.max_ranks,
             detailed=args.detailed,
+            plot=args.plot,
         )
 
