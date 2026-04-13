@@ -536,6 +536,7 @@ def _build_summary_table(
     footer_label: str = "",
     footer_dur_us: float = 0.0,
     show_intervals: bool = False,
+    show_footer: bool = True,
 ) -> Table:
     """
     Build a unified Rich summary table used by both breakdown functions.
@@ -546,7 +547,7 @@ def _build_summary_table(
     footer_ms  = f"{footer_dur_us / nbatches / 1e3:.2f}" if nbatches > 0 else "—"
 
     t = Table(title=f"[bold]{title}[/bold]", title_justify="left",
-              box=box.SIMPLE_HEAD, header_style="bold cyan", show_footer=True)
+              box=box.SIMPLE_HEAD, header_style="bold cyan", show_footer=show_footer)
     t.add_column("Section",        style="bold",    footer=f"[dim]{footer_label}[/dim]")
     t.add_column("Duration (s)",   justify="right", footer=f"[dim]{footer_dur_us / 1e6:.3f}[/dim]")
     t.add_column("Per batch (ms)", justify="right", footer=f"[dim]{footer_ms}[/dim]")
@@ -640,7 +641,6 @@ def print_trace_metadata(df: pd.DataFrame) -> None:
     else:
         table.add_row("Devices", "-")
 
-    console.print()
     console.print(table)
 
     if isinstance(device_properties, dict) and device_properties:
@@ -736,7 +736,7 @@ def _plot_time_breakdowns(
     mean_batch_us: float = 0.0,
     savepath: str = "",
 ) -> None:
-    """Plot publication-quality pie charts for time breakdowns."""
+    """Plot pie charts for time breakdowns."""
     charts = [d for d in [fwd_bwd_data, enc_dec_data] if d is not None]
     if not charts:
         return
@@ -812,7 +812,7 @@ def _plot_gpu_time_breakdown(
     mean_batch_us: float = 0.0,
     savepath: str = "",
 ) -> None:
-    """Plot a publication-quality bar chart for the GPU time breakdown."""
+    """Plot a bar chart for the GPU time breakdown."""
     colors = _PALETTES[-1 % len(_PALETTES)]
     values_s = [t / 1e6 for t in times_us]
     max_val = max(values_s, default=1)
@@ -893,12 +893,12 @@ def total_time_breakdown(
             console.print(f"[yellow]⚠  Total recorded time is zero — skipping {section_title}.[/yellow]")
             continue
 
-        if chart_idx == 0:
-            console.print(
-                f"\n[bold]Total:[/bold] [yellow]{ttotal / 1e6:.2f} s[/yellow]  "
-                f"[bold]Throughput:[/bold] [yellow]{throughput:.2f} it/s[/yellow]  "
-                f"[dim](avg run_training_batch = {mean_batch_us / 1e6:.3f} s)[/dim]\n"
-            )
+        #if chart_idx == 0:
+        #    console.print(
+        #        f"\n[bold]Total:[/bold] [yellow]{ttotal / 1e6:.2f} s[/yellow]  "
+        #        f"[bold]Throughput:[/bold] [yellow]{throughput:.2f} it/s[/yellow]  "
+        #        f"[dim](avg run_training_batch = {mean_batch_us / 1e6:.3f} s)[/dim]\n"
+        #    )
 
         rows = [{"label": l, "dur_us": float(t)} for l, t in zip(chart_labels, tselected_l)]
         rows_with_comm = []
@@ -941,7 +941,7 @@ def total_time_breakdown(
         else:
             enc_dec_data = data_tuple
 
-    console.print("[dim]ℹ  Note: not all decoder/encoder/processor sections are instrumented yet.[/dim]\n")
+    console.print("[dim]ℹ  Note: not all decoder/encoder/processor sections are annotated in the backward pass yet.[/dim]\n")
 
     if plot and ttotal_recorded > 0 and (fwd_bwd_data or enc_dec_data):
         _plot_time_breakdowns(
@@ -964,11 +964,11 @@ def gpu_time_breakdown(
     ttotal = float(df["end_time"].max() - df["ts"].min())
     nbatches, mean_batch_us, throughput, _ = _batch_stats(df)
 
-    console.print(
-        f"\n[bold]Total:[/bold] [yellow]{ttotal / 1e6:.3f} s[/yellow]  "
-        f"[bold]Throughput:[/bold] [yellow]{throughput:.2f} it/s[/yellow]  "
-        f"[dim](avg run_training_batch = {mean_batch_us / 1e6:.3f} s)[/dim]\n"
-    )
+  #  console.print(
+  #      f"\n[bold]Total:[/bold] [yellow]{ttotal / 1e6:.3f} s[/yellow]  "
+  #      f"[bold]Throughput:[/bold] [yellow]{throughput:.2f} it/s[/yellow]  "
+  #      f"[dim](avg run_training_batch = {mean_batch_us / 1e6:.3f} s)[/dim]\n"
+   # )
 
     sections = [
         ("Computation",   {"cat": ["kernel"],                   "name": [],                        "excl": ["nccl"]}),
@@ -998,20 +998,24 @@ def gpu_time_breakdown(
     rows = [{"label": l, "dur_us": t}
             for l, t in zip(section_labels, section_times)]
     console.print(_build_summary_table(
-        title="GPU time breakdown (sections may overlap)",
+        title="GPU time breakdown",
         rows=rows,
         ttotal_us=ttotal,
         nbatches=nbatches,
         footer_label="GPU Active (merged)",
         footer_dur_us=gpu_active,
+        show_footer=False,
     ))
 
     if ttotal > 0:
+        gpu_active_pct = 100 * gpu_active / ttotal
+        gpu_idle_pct = 100 * gpu_idle / ttotal
         console.print(
-            f"GPU Idle: [yellow] {gpu_idle / 1e6:.3f} s ({100 * gpu_idle / ttotal:.2f}%)[/yellow]"
+            f"GPU Active: [yellow]{gpu_active / 1e6:.3f} s ({gpu_active_pct:.2f}%)[/yellow] "
+            f"GPU Idle: [yellow]{gpu_idle / 1e6:.3f} s ({gpu_idle_pct:.2f}%)[/yellow] "
+            f"of total GPU time [yellow]{ttotal / 1e6:.3f} s (100%)[/yellow]"
         )
     console.print("[dim]ℹ  Sections overlap across streams — percentages may sum to >100%.[/dim]\n")
-
     summary_df = pd.DataFrame([
         {"Section": l, "Duration (s)": t / 1e6,
          "% of Total": 100 * t / ttotal if ttotal > 0 else 0}
@@ -1058,12 +1062,16 @@ def get_detailed_breakdown(
         console.print(f"[yellow]⚠  No annotations found for section '{section}'[/yellow]")
         return pd.DataFrame()
 
-    total_wall_time = _merged_duration(df_section)
+    df_cat = df[df["cat"] == cat_filter].sort_values("ts")
+    total_active_cat_time = _merged_duration(df_cat)
 
-    df_annotations = df_section[df_section["cat"] == cat_filter]
-    if df_annotations.empty:
+    df_section_cat = df_section[df_section["cat"] == cat_filter]
+    if df_section_cat.empty:
         console.print(f"[yellow]⚠  No {label} annotations found for section '{section}'[/yellow]")
         return pd.DataFrame()
+
+    section_active_cat_time = _merged_duration(df_section_cat)
+    df_annotations = df_section_cat
 
     # Filter to leaf-only annotations.
     # Annotation names have the form "anemoi-<Class>-<module.path>.forward/.backward".
@@ -1094,8 +1102,12 @@ def get_detailed_breakdown(
     )
     df_annotations["total time sec"] = df_annotations["total time us"] / 1e6
 
+    section_pct_of_total_cat = (
+        100 * section_active_cat_time / total_active_cat_time if total_active_cat_time > 0 else 0.0
+    )
     console.print(
-        f"\n[bold]Total active wall time:[/bold] [yellow]{total_wall_time / 1e6:.3f} s[/yellow]\n"
+        f"\n[bold]Section active {label} time:[/bold] [yellow]{section_active_cat_time / 1e6:.3f} s "
+        f"({section_pct_of_total_cat:.2f}%)[/yellow] of total active {label} time [yellow]{total_active_cat_time / 1e6:.3f} s[/yellow]\n"
     )
 
     for suffix, title in [(".forward", "Forward"), (".backward", "Backward")]:
@@ -1104,13 +1116,98 @@ def get_detailed_breakdown(
             console.print(f"[dim]No {title.lower()} pass annotations found.[/dim]")
             continue
         ttime_active = _merged_duration(df_section[df_section["name"].isin(df_pass["name"]) & (df_section["cat"] == cat_filter)])
-        ttime_active_p = 100 * ttime_active / total_wall_time if total_wall_time > 0 else 0.0
+        ttime_active_p = 100 * ttime_active / section_active_cat_time if section_active_cat_time > 0 else 0.0
         console.print(_build_breakdown_table(
-            df_pass, f"Top 10 {title} Pass Contributors", section, ttime_active, ttime_active_p
+            df_pass, f"{title} Pass", section, ttime_active, ttime_active_p
         ))
 
     console.print()
     return df_annotations
+
+def print_global_contributors_breakdown(df: pd.DataFrame, gpu: bool = True) -> None:
+    """Print global top-10 contributors (leaf annotations) across all model sections.
+    
+    Analyzes GPU or CPU annotations, combining forward and backward passes,
+    without filtering by specific model sections (encoder/processor/decoder).
+    
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Trace DataFrame with 'ts', 'dur', 'end_time', 'cat', 'name' columns.
+    gpu : bool, optional
+        If True, analyze GPU annotations; otherwise CPU annotations. Defaults to True.
+    """
+    df = _load_df(df)
+    
+    label = "GPU" if gpu else "CPU"
+    cat_filter = "gpu_user_annotation" if gpu else "user_annotation"
+    
+    # Helper to extract module path from annotation name
+    def _module_path(name: str) -> str:
+        """Extract the module path from an annotation name."""
+        parts = name.split("-", 2)
+        if len(parts) != 3:
+            return name
+        path = parts[2]
+        for sfx in (".forward", ".backward"):
+            if path.endswith(sfx):
+                return path[: -len(sfx)]
+        return path
+    
+    total_wall_time = float(df["end_time"].max() - df["ts"].min()) if not df.empty else 0.0
+    
+    # Get all annotations for this category, filtered to anemoi-named events
+    df_annotations = df[
+        (df["cat"] == cat_filter) & df["name"].str.contains("anemoi", regex=True, na=False)
+    ]
+    if df_annotations.empty:
+        console.print(f"[yellow]⚠  No {label} annotations found[/yellow]")
+        return
+
+    total_active_cat_time = _merged_duration(df_annotations)
+    total_cat_pct_of_wall = (
+        100 * total_active_cat_time / total_wall_time if total_wall_time > 0 else 0.0
+    )
+    console.print(
+        f"[bold]Total active {label} time (annotated):[/bold] [yellow]{total_active_cat_time / 1e6:.3f} s "
+        f"({total_cat_pct_of_wall:.2f}%)[/yellow] of total wall time [yellow]{total_wall_time / 1e6:.3f} s[/yellow]"
+    )
+    
+    # Filter to leaf-only annotations
+    # Leaf annotations are those whose module path is not a prefix of any other module path
+    all_names = sorted(df_annotations["name"].unique())
+    name_to_path = {n: _module_path(n) for n in all_names}
+    path_set = set(name_to_path.values())
+    leaf_names = [
+        n for n in all_names
+        if not any(p.startswith(name_to_path[n] + ".") for p in path_set if p != name_to_path[n])
+    ]
+    df_annotations = df_annotations[df_annotations["name"].isin(leaf_names)]
+    
+    # Compute runtime statistics
+    df_stats = runtime_analysis(df_annotations).sort_values(
+        ["total time us", "name"], ascending=[False, True]
+    )
+    df_stats["total time sec"] = df_stats["total time us"] / 1e6
+    
+    # Get top 10 and compute stats for the table
+    df_top10 = df_stats.head(10)
+    if df_top10.empty:
+        console.print(f"[dim]No leaf annotations found for {label}.[/dim]")
+        return
+    
+    # Compute merged duration for the top 10 contributors
+    top10_names = df_top10["name"].tolist()
+    df_top10_events = df[df["name"].isin(top10_names) & (df["cat"] == cat_filter)]
+    ttime_active = _merged_duration(df_top10_events)
+    ttime_active_p = 100 * ttime_active / total_wall_time if total_wall_time > 0 else 0.0
+    
+    # Print table with global title (no section filter)
+    console.print(_build_breakdown_table(
+        df_top10, f"", "global", ttime_active, ttime_active_p
+    ))
+    
+    console.print()
 
 def find_first_trace_file(dirpath: Union[str, Path]) -> Optional[str]:
     """Find the first ``*.pt.trace.json`` file in a directory.
@@ -1218,7 +1315,7 @@ def _print_multi_rank_overview(rows: list[dict]) -> None:
     rows_sorted = sorted(rows, key=lambda x: (x["rank"] is None, x["rank"]))
 
     table = Table(
-        title="All-rank performance overview",
+        title="Performance overview per rank",
         box=box.SIMPLE_HEAVY,
         header_style="bold cyan",
         show_lines=False,
@@ -1241,6 +1338,9 @@ def _print_multi_rank_overview(rows: list[dict]) -> None:
         )
     console.print()
     console.print(table)
+
+    if len(rows_sorted) <= 1:
+        return
 
     metric_specs = [
         ("Throughput (it/s)", "throughput"),
@@ -1747,7 +1847,7 @@ def analyse_trace(
     nranks = len(selected_trace_files)
     nbatches = summaries[0]["nbatches"]
     console.rule(
-        f"[bold]TRACE ANALYSIS[/bold] of {nranks} rank's · recorded {nbatches} batches",
+        f"[bold]TRACE ANALYSIS[/bold] · number of ranks {nranks} · number of recorded batches {nbatches}",
         align="left",
     )
     _print_multi_rank_overview(summaries)
@@ -1763,16 +1863,13 @@ def analyse_trace(
         rank_data.append((rank, trace_file, trace_stem, df))
 
     # ── Metadata ─────────────────────────────────────────────────────────────
-    console.rule("[bold]METADATA[/bold]\n", align="left")
-    console.print("\n")
-
-    for rank, trace_file, _, df in rank_data:
-        console.rule(f"Rank {rank}\n", align="left", style="dim")
-        console.print("\n")
-        print_trace_metadata(df)
+    console.rule("[bold]ARCHITECTURE[/bold]", align="left", style="dim cyan")
+    # Metadata is printed once from the first selected trace (rank 0 in sorted order).
+    _, _, _, df0 = rank_data[0]
+    print_trace_metadata(df0)
 
     # ── Total time breakdown ──────────────────────────────────────────────────
-    console.rule("[bold]TIME BREAKDOWN[/bold]\n", align="left")
+    console.rule("[bold]TIME BREAKDOWN[/bold]", align="left", style="dim cyan")
     console.print("\n")
 
     for rank, trace_file, trace_stem, df in rank_data:
@@ -1782,7 +1879,7 @@ def analyse_trace(
         total_time_breakdown(df, plot=plot, savepath=total_plot_path)
 
     # ── GPU time breakdown ────────────────────────────────────────────────────
-    console.rule("[bold]GPU TIME BREAKDOWN[/bold]\n", align="left")
+    console.rule("[bold]GPU TIME BREAKDOWN[/bold]", align="left", style="dim cyan")
     console.print("\n")
     for rank, trace_file, trace_stem, df in rank_data:
         console.rule(f"Rank {rank}\n", align="left", style="dim")
@@ -1795,25 +1892,30 @@ def analyse_trace(
         return
 
     console.rule(
-        f"[bold]DETAILED TRACE ANALYSIS[/bold] of {nranks} rank's · recorded {nbatches} batches\n",
+        f"[bold]DETAILED TRACE ANALYSIS[/bold] · number of ranks {nranks} · number of recorded batches {nbatches}\n",
         align="left",
     )
     console.print("\n")
+
        # ── Detailed breakdown ────────────────────────────────────────────────────
     for rank, trace_file, _, df in rank_data:
         console.rule(f"Rank {rank}\n", align="left", style="dim")
         console.print("\n")
-        console.rule(f"GPU Time — ENCODER - Rank {rank}",  align="left", style='dim yellow')
+        console.rule(f"GPU time - SUMMARY - rank {rank}",  align="left", style='dim cyan')
+        print_global_contributors_breakdown(df, gpu=True)
+        console.rule(f"CPU time - SUMMARY - rank {rank}",  align="left", style='dim cyan')
+        print_global_contributors_breakdown(df, gpu=False)
+        console.rule(f"GPU time — ENCODER - rank {rank}",  align="left", style='dim yellow')
         get_detailed_breakdown(df, section="model.encoder")
-        console.rule(f"CPU Time — ENCODER - Rank {rank}",  align="left", style='dim yellow')
+        console.rule(f"CPU time — ENCODER - rank {rank}",  align="left", style='dim yellow')
         get_detailed_breakdown(df, section="model.encoder", gpu=False)
-        console.rule(f"GPU Time — PROCESSOR - Rank {rank}",  align="left", style='dim yellow')
+        console.rule(f"GPU time — PROCESSOR - rank {rank}",  align="left", style='dim yellow')
         get_detailed_breakdown(df, section="model.processor")
-        console.rule(f"CPU Time — PROCESSOR - Rank {rank}",  align="left", style='dim yellow')
+        console.rule(f"CPU time — PROCESSOR - rank {rank}",  align="left", style='dim yellow')
         get_detailed_breakdown(df, section="model.processor", gpu=False)
-        console.rule(f"GPU Time — DECODER - Rank {rank}",  align="left", style='dim yellow')
+        console.rule(f"GPU time — DECODER - rank {rank}",  align="left", style='dim yellow')
         get_detailed_breakdown(df, section="model.decoder")
-        console.rule(f"CPU Time — DECODER - Rank {rank}",  align="left", style='dim yellow')
+        console.rule(f"CPU time — DECODER - rank {rank}",  align="left", style='dim yellow')
         get_detailed_breakdown(df, section="model.decoder", gpu=False)
 
 
