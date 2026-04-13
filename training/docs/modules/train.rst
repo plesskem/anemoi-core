@@ -57,8 +57,6 @@ method and optionally customizing the initialization logic in
    positions.
 -  ``supporting_arrays``: Optional maps like topography or land-sea
    masks.
--  ``truncation_data``: Masking information to restrict training or
-   validation to a subset of time or space.
 
 **Subclasses must implement:**
 
@@ -89,7 +87,9 @@ Current supported graphmodules include:
 #. **Ensemble Forecasting** —
    :class:`~anemoi.training.train.tasks.ensforecaster.GraphEnsForecaster`
 #. **Time Interpolation** —
-   :class:`~anemoi.training.train.tasks.interpolator.GraphInterpolator`
+   :class:`~anemoi.training.train.tasks.interpolator.GraphMultiOutInterpolator`
+#. **AutoEncoder** —
+   :class:`~anemoi.training.train.tasks.autoencoder.GraphAutoEncoder`
 
 Each of these implements the ``__init__`` and ``_step`` methods to
 define task-specific model behavior. They support full Lightning
@@ -102,6 +102,23 @@ Key methods to override when adapting or extending a model:
    components.
 -  ``_step``: Implements the forward pass and loss/metric computation
    for a single batch.
+
+Task ``_step`` return contract
+==============================
+
+Task implementations are expected to return a 3-tuple with a consistent
+shape across all task types:
+
+- ``loss``: a tensor scalar used for optimization.
+- ``metrics``: a mapping of metric names to tensors.
+- ``predictions``: a list of per-step dictionaries keyed by dataset
+  name.
+
+For single-output tasks (for example diffusion and autoencoder), the
+``predictions`` value is a one-element list. For rollout-based tasks,
+the list contains one entry per rollout step. This shared contract keeps
+plotting callbacks task-agnostic and avoids task-specific unpacking
+logic.
 
 .. automodule:: anemoi.training.train.tasks.forecaster
    :members:
@@ -118,9 +135,24 @@ Key methods to override when adapting or extending a model:
    :no-undoc-members:
    :show-inheritance:
 
+.. automodule:: anemoi.training.train.tasks.autoencoder
+   :members:
+   :no-undoc-members:
+   :show-inheritance:
+
 *********************
  Training Controller
 *********************
+
+The training process is orchestrated by
+:class:`~anemoi.training.train.train.AnemoiTrainer`, which wraps a
+PyTorch Lightning Trainer and provides additional logic for:
+
+-  Distributed training and inference
+-  Dynamic loss scheduling and learning rate adjustment
+-  Logging and profiling via ``profiler.py``
+-  Dataset loading
+-  Graph loading and creation
 
 The training process is orchestrated by
 :class:`~anemoi.training.train.train.AnemoiTrainer`, which wraps a
