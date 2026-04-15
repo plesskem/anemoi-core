@@ -24,7 +24,7 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 from matplotlib.patches import FancyArrowPatch
 LOGGER = logging.getLogger(__name__)
-console = Console(record=True, width=200)
+console = Console(record=True, width=185)
 
 
 def _parse_device_properties(device_list: list) -> dict:
@@ -974,6 +974,8 @@ def gpu_time_breakdown(
         section_times.append(dur)
         gpu_dfs.append(merged_df)
 
+    comp_comm_overlap = _interval_overlap_duration(gpu_dfs[0], gpu_dfs[1])
+
     gpu_active = _merged_duration(pd.concat([g for g in gpu_dfs[:3] if not g.empty], ignore_index=True))
     gpu_idle = ttotal - gpu_active
 
@@ -992,10 +994,21 @@ def gpu_time_breakdown(
     if ttotal > 0:
         gpu_active_pct = 100 * gpu_active / ttotal
         gpu_idle_pct = 100 * gpu_idle / ttotal
+        comp_comm_overlap_pct_total = 100 * comp_comm_overlap / ttotal
+        comm_total = float(section_times[1])
+        comp_total = float(section_times[0])
+        comp_comm_overlap_pct_comm = 100 * comp_comm_overlap / comm_total if comm_total > 0 else 0.0
+        comp_comm_overlap_pct_comp = 100 * comp_comm_overlap / comp_total if comp_total > 0 else 0.0
         console.print(
             f"GPU Active: [yellow]{gpu_active / 1e6:.3f} s ({gpu_active_pct:.2f}%)[/yellow] "
             f"GPU Idle: [yellow]{gpu_idle / 1e6:.3f} s ({gpu_idle_pct:.2f}%)[/yellow] "
             f"of total wall time [yellow]{ttotal / 1e6:.3f} s (100%)[/yellow]"
+        )
+        console.print("\n")
+        console.print(
+            f"Communication overlap: [yellow]{comp_comm_overlap / 1e6:.3f} s[/yellow] "
+            f"({comp_comm_overlap_pct_total:.2f}% of total, "
+            f"{comp_comm_overlap_pct_comm:.2f}% of comm, {comp_comm_overlap_pct_comp:.2f}% of comp)"
         )
     console.print("[dim]ℹ  Sections overlap across streams — percentages may sum to >100%.[/dim]\n")
     summary_df = pd.DataFrame([
@@ -1003,6 +1016,8 @@ def gpu_time_breakdown(
          "% of Total": 100 * t / ttotal if ttotal > 0 else 0}
         for l, t in zip(section_labels, section_times)
     ] + [
+        {"Section": "Comm∩Comp overlap", "Duration (s)": comp_comm_overlap / 1e6,
+         "% of Total": 100 * comp_comm_overlap / ttotal if ttotal > 0 else 0},
         {"Section": "GPU Active (merged)", "Duration (s)": gpu_active / 1e6,
          "% of Total": 100 * gpu_active / ttotal if ttotal > 0 else 0},
         {"Section": "GPU Idle", "Duration (s)": gpu_idle / 1e6,
@@ -1150,7 +1165,7 @@ def print_global_contributors_breakdown(df: pd.DataFrame, gpu: bool = True) -> N
         return
 
     total_active_cat_time = _merged_duration(df_annotations)
-    total_wall_cat_time = float(df_annotations["end_time"].max() - df_annotations["ts"].min()) if not df_annotations.empty else 0.0
+    #total_wall_cat_time = float(df_annotations["end_time"].max() - df_annotations["ts"].min()) if not df_annotations.empty else 0.0
     total_cat_pct_of_wall = (
         100 * total_active_cat_time / total_wall_time if total_wall_time > 0 else 0.0
     )
