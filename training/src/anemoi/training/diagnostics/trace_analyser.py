@@ -121,7 +121,7 @@ def trace_to_dataframe(trace_file: str, cols: Optional[list[str]] = None) -> pd.
         raise ValueError(error_msg)
 
     if cols is None:
-        cols = ["cat", "name", "ts", "dur"]
+        cols = ["cat", "name", "ts", "dur", "args"]
 
     events = []
     for event in trace_data["traceEvents"]:
@@ -505,6 +505,7 @@ def _batch_stats(df: pd.DataFrame) -> tuple[int, float, float, float]:
 
     mean_batch_us = float(batch_df["dur"].mean())
     throughput = (1e6 / mean_batch_us) if mean_batch_us > 0 else 0.0
+
     total_batch_us = float(batch_df["dur"].sum())
     return nbatches, mean_batch_us, throughput, total_batch_us
 
@@ -520,7 +521,8 @@ def _savefig(fig, savepath: str) -> None:
 
 def _suptitle(fig, nbatches: int, ttotal_us: float, mean_batch_us: float = 0.0) -> None:
     """Attach a standard throughput suptitle to a figure."""
-    throughput = (1e6 / mean_batch_us) if mean_batch_us > 0 else (nbatches / (ttotal_us / 1e6) if ttotal_us > 0 else 0)
+    #throughput = (1e6 / mean_batch_us) if mean_batch_us > 0 else (nbatches / (ttotal_us / 1e6) if ttotal_us > 0 else 0)
+    throughput = nbatches / (ttotal_us / 1e6) if ttotal_us > 0 else 0.0
     fig.suptitle(
         f"Batches: {nbatches}  ·  Total: {ttotal_us / 1e6:.3f} s  ·  "
         f"Throughput: {throughput:.2f} it/s",
@@ -678,14 +680,11 @@ def _build_section_comm_table(
     title: str,
     rows: list[dict],
     ttotal_us: float,
-    nbatches: int,
-    total_batch_us: float,
     footer_label: str,
     footer_dur_us: float,
 ) -> Table:
     """Build section breakdown table with NCCL communication overlap columns."""
     footer_pct_total = f"{100 * footer_dur_us / ttotal_us:.2f}%" if ttotal_us > 0 else "—"
-    footer_ms = f"{footer_dur_us / nbatches / 1e3:.2f}" if nbatches > 0 else "—"
 
     t = Table(
         title=f"[bold]{title}[/bold]",
@@ -696,10 +695,7 @@ def _build_section_comm_table(
     )
     t.add_column("Section", style="bold", footer=f"[dim]{footer_label}[/dim]")
     t.add_column("Duration (s)", justify="right", footer=f"[dim]{footer_dur_us / 1e6:.3f}[/dim]")
-    t.add_column("Per batch (ms)", justify="right", footer=f"[dim]{footer_ms}[/dim]")
     t.add_column("% of Total", justify="right", footer=f"[dim]{footer_pct_total}[/dim]")
-    t.add_column("% of Batch", justify="right", footer="")
-    t.add_column("Eq. it/s", justify="right", footer="")
     t.add_column("Comm (s)", justify="right", footer="")
     t.add_column("Comm % Section", justify="right", footer="")
     t.add_column("Comm % Total", justify="right", footer="")
@@ -708,18 +704,12 @@ def _build_section_comm_table(
         dur_us = float(r["dur_us"])
         comm_us = float(r.get("comm_us", 0.0))
         pct_total = f"{100 * dur_us / ttotal_us:.2f}%" if ttotal_us > 0 else "—"
-        per_batch_ms = f"{dur_us / nbatches / 1e3:.2f}" if nbatches > 0 else "—"
-        pct_batch = f"{100 * dur_us / total_batch_us:.2f}%" if total_batch_us > 0 else "—"
-        eq_it_s = f"{1e6 / (dur_us / nbatches):.2f}" if nbatches > 0 and dur_us > 0 else "—"
         comm_pct_section = f"{100 * comm_us / dur_us:.2f}%" if dur_us > 0 else "—"
         comm_pct_total = f"{100 * comm_us / ttotal_us:.2f}%" if ttotal_us > 0 else "—"
         t.add_row(
             r["label"],
             f"{dur_us / 1e6:.3f}",
-            per_batch_ms,
             pct_total,
-            pct_batch,
-            eq_it_s,
             f"{comm_us / 1e6:.3f}",
             comm_pct_section,
             comm_pct_total,
@@ -858,12 +848,6 @@ def total_time_breakdown(
     fwd_bwd_data = enc_dec_data = None
     ttotal_recorded = float(df["end_time"].max() - df["ts"].min()) if not df.empty else 0.0
     comm_events = df[df["name"].str.contains("nccl", case=False, na=False)].sort_values("ts")
-    batch_events = df[df["name"].str.contains("run_training_batch", na=False)].sort_values("ts")
-    batch_intervals = (
-        merge_overlapping_intervals_df(batch_events[["ts", "end_time"]])
-        if not batch_events.empty
-        else pd.DataFrame(columns=["ts", "end_time"])
-    )
     comm_intervals = (
         merge_overlapping_intervals_df(comm_events[["ts", "end_time"]])
         if not comm_events.empty
@@ -910,9 +894,6 @@ def total_time_breakdown(
                 if not section_events.empty
                 else pd.DataFrame(columns=["ts", "end_time"])
             )
-            # Restrict section time to iteration windows for per-batch realism.
-            if not batch_intervals.empty:
-                row["dur_us"] = _interval_overlap_duration(section_intervals, batch_intervals)
             row["comm_us"] = _interval_overlap_duration(section_intervals, comm_intervals)
             rows_with_comm.append(row)
 
@@ -920,8 +901,6 @@ def total_time_breakdown(
             title=section_title,
             rows=rows_with_comm,
             ttotal_us=ttotal,
-            nbatches=nbatches,
-            total_batch_us=total_batch_us,
             footer_label="Elsewhere",
             footer_dur_us=float(tidle),
         )
@@ -962,6 +941,9 @@ def gpu_time_breakdown(
     """Print a GPU-centric time breakdown and optionally plot a bar chart."""
     df = _load_df(tracefile_or_df)
     ttotal = float(df["end_time"].max() - df["ts"].min())
+   # df_gpu = df[df["args"].apply(lambda x: isinstance(x, dict) and "stream" in x)].sort_values("ts")
+   # ttotal_gpu = float(df_gpu["end_time"].max() - df_gpu["ts"].min()) if not df_gpu.empty else 0.0
+   # print(f"\nTotal recorded time: {ttotal / 1e6:.3f} s, GPU time range: {ttotal_gpu / 1e6:.3f} s")
     nbatches, mean_batch_us, throughput, _ = _batch_stats(df)
 
   #  console.print(
@@ -1013,7 +995,7 @@ def gpu_time_breakdown(
         console.print(
             f"GPU Active: [yellow]{gpu_active / 1e6:.3f} s ({gpu_active_pct:.2f}%)[/yellow] "
             f"GPU Idle: [yellow]{gpu_idle / 1e6:.3f} s ({gpu_idle_pct:.2f}%)[/yellow] "
-            f"of total GPU time [yellow]{ttotal / 1e6:.3f} s (100%)[/yellow]"
+            f"of total wall time [yellow]{ttotal / 1e6:.3f} s (100%)[/yellow]"
         )
     console.print("[dim]ℹ  Sections overlap across streams — percentages may sum to >100%.[/dim]\n")
     summary_df = pd.DataFrame([
@@ -1056,22 +1038,25 @@ def get_detailed_breakdown(
     df = _load_df(df)
     label = "GPU" if gpu else "CPU"
     cat_filter = "gpu_user_annotation" if gpu else "user_annotation"
-
-    df_section = df[df["name"].str.contains(section, regex=True, na=False)].sort_values("ts")
-    if df_section.empty:
-        console.print(f"[yellow]⚠  No annotations found for section '{section}'[/yellow]")
-        return pd.DataFrame()
-
-    df_cat = df[df["cat"] == cat_filter].sort_values("ts")
-    total_active_cat_time = _merged_duration(df_cat)
-
-    df_section_cat = df_section[df_section["cat"] == cat_filter]
+    df_cat_anno= df[
+        (df["cat"] == cat_filter) & df["name"].str.contains("anemoi", regex=True, na=False)
+    ]
+    df_section_cat = df_cat_anno[df_cat_anno["name"].str.contains(section, regex=True, na=False)].sort_values("ts")
     if df_section_cat.empty:
-        console.print(f"[yellow]⚠  No {label} annotations found for section '{section}'[/yellow]")
+        console.print(f"[yellow]⚠  No annotations found for section '{section}' in cat {label} [/yellow]")
         return pd.DataFrame()
+
+    #df_cat = df[df["cat"] == cat_filter].sort_values("ts")
+    
+    total_active_cat_time = _merged_duration(df_cat_anno)
+
+    #df_section_cat = df_section[df_section["cat"] == cat_filter]
+   # if df_section_cat.empty:
+    #    console.print(f"[yellow]⚠  No {label} annotations found for section '{section}'[/yellow]")
+     #   return pd.DataFrame()
 
     section_active_cat_time = _merged_duration(df_section_cat)
-    df_annotations = df_section_cat
+    #df_annotations = df_section_cat
 
     # Filter to leaf-only annotations.
     # Annotation names have the form "anemoi-<Class>-<module.path>.forward/.backward".
@@ -1088,41 +1073,41 @@ def get_detailed_breakdown(
                 return path[: -len(sfx)]
         return path
 
-    all_names = sorted(df_annotations["name"].unique())
+    all_names = sorted(df_section_cat["name"].unique())
     name_to_path = {n: _module_path(n) for n in all_names}
     path_set = set(name_to_path.values())
     leaf_names = [
         n for n in all_names
         if not any(p.startswith(name_to_path[n] + ".") for p in path_set if p != name_to_path[n])
     ]
-    df_annotations = df_annotations[df_annotations["name"].isin(leaf_names)]
+    df_section_cat_leafs = df_section_cat[df_section_cat["name"].isin(leaf_names)]
 
-    df_annotations = runtime_analysis(df_annotations).sort_values(
+    df_section_cat_leafs = runtime_analysis(df_section_cat_leafs).sort_values(
         ["total time us", "name"], ascending=[False, True]
     )
-    df_annotations["total time sec"] = df_annotations["total time us"] / 1e6
+    df_section_cat_leafs["total time sec"] = df_section_cat_leafs["total time us"] / 1e6
 
     section_pct_of_total_cat = (
         100 * section_active_cat_time / total_active_cat_time if total_active_cat_time > 0 else 0.0
     )
     console.print(
-        f"\n[bold]Section active {label} time:[/bold] [yellow]{section_active_cat_time / 1e6:.3f} s "
-        f"({section_pct_of_total_cat:.2f}%)[/yellow] of total active {label} time [yellow]{total_active_cat_time / 1e6:.3f} s[/yellow]\n"
+        f"\n[bold]Section active {label} time (user annotated):[/bold] [yellow]{section_active_cat_time / 1e6:.3f} s "
+        f"({section_pct_of_total_cat:.2f}%)[/yellow] of total active {label} time (user annotated): [yellow]{total_active_cat_time / 1e6:.3f} s[/yellow]\n"
     )
 
     for suffix, title in [(".forward", "Forward"), (".backward", "Backward")]:
-        df_pass = df_annotations[df_annotations["name"].str.endswith(suffix)].head(10)
+        df_pass = df_section_cat_leafs[df_section_cat_leafs["name"].str.endswith(suffix)].head(10)
         if df_pass.empty:
             console.print(f"[dim]No {title.lower()} pass annotations found.[/dim]")
             continue
-        ttime_active = _merged_duration(df_section[df_section["name"].isin(df_pass["name"]) & (df_section["cat"] == cat_filter)])
+        ttime_active = _merged_duration(df_section_cat[df_section_cat["name"].isin(df_pass["name"])])
         ttime_active_p = 100 * ttime_active / section_active_cat_time if section_active_cat_time > 0 else 0.0
         console.print(_build_breakdown_table(
             df_pass, f"{title} Pass", section, ttime_active, ttime_active_p
         ))
 
     console.print()
-    return df_annotations
+    return df_section_cat_leafs
 
 def print_global_contributors_breakdown(df: pd.DataFrame, gpu: bool = True) -> None:
     """Print global top-10 contributors (leaf annotations) across all model sections.
@@ -1165,11 +1150,12 @@ def print_global_contributors_breakdown(df: pd.DataFrame, gpu: bool = True) -> N
         return
 
     total_active_cat_time = _merged_duration(df_annotations)
+    total_wall_cat_time = float(df_annotations["end_time"].max() - df_annotations["ts"].min()) if not df_annotations.empty else 0.0
     total_cat_pct_of_wall = (
         100 * total_active_cat_time / total_wall_time if total_wall_time > 0 else 0.0
     )
     console.print(
-        f"[bold]Total active {label} time (annotated):[/bold] [yellow]{total_active_cat_time / 1e6:.3f} s "
+        f"[bold]Total active {label} time (user annotated):[/bold] [yellow]{total_active_cat_time / 1e6:.3f} s "
         f"({total_cat_pct_of_wall:.2f}%)[/yellow] of total wall time [yellow]{total_wall_time / 1e6:.3f} s[/yellow]"
     )
     
@@ -1200,7 +1186,7 @@ def print_global_contributors_breakdown(df: pd.DataFrame, gpu: bool = True) -> N
     top10_names = df_top10["name"].tolist()
     df_top10_events = df[df["name"].isin(top10_names) & (df["cat"] == cat_filter)]
     ttime_active = _merged_duration(df_top10_events)
-    ttime_active_p = 100 * ttime_active / total_wall_time if total_wall_time > 0 else 0.0
+    ttime_active_p = 100 * ttime_active / total_active_cat_time if total_active_cat_time > 0 else 0.0
     
     # Print table with global title (no section filter)
     console.print(_build_breakdown_table(
@@ -1265,6 +1251,7 @@ def _compute_rank_overview(df: pd.DataFrame) -> dict:
 
     ttotal = float(dfx["end_time"].max() - dfx["ts"].min())
     nbatches, mean_batch_us, throughput, total_batch_us = _batch_stats(dfx)
+    throughput = (nbatches) / (ttotal / 1e6) if ttotal > 0 else 0.0
 
     # Mirror section logic from gpu_time_breakdown for consistent definitions.
     sections = [

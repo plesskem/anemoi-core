@@ -236,3 +236,73 @@ def user_annotate_children(model: nn.Module, prefix: str = '', use_backward: boo
     #if len(list(model.children())) == 0:
         #model.forward = add_annotations_to_forward(f"{prefix}(LEAF)", model)
     #return model
+
+#def user_annotate_children(model: nn.Module, prefix: str = '', use_backward: bool = True) -> nn.Module:
+    #def _make_marker(name: str, module: nn.Module) -> str:
+        #parts = [part for part in name.split('.') if not part.isdigit()]
+        #return f"{module.__class__.__name__}-{'.'.join(parts)}"
+
+    #def _extract_tensor(obj):
+        #"""Return first tensor requiring grad (cheap + sufficient)."""
+        #if isinstance(obj, torch.Tensor) and obj.requires_grad:
+            #return obj
+        #elif isinstance(obj, (list, tuple)):
+            #for o in obj:
+                #t = _extract_tensor(o)
+                #if t is not None:
+                    #return t
+        #elif isinstance(obj, dict):
+            #for o in obj.values():
+                #t = _extract_tensor(o)
+                #if t is not None:
+                    #return t
+        #return None
+
+    #for child_name, child in model.named_children():
+        #full_name = f"{prefix}{child_name}"
+        #marker = _make_marker(full_name, child)
+
+        ## Recurse first (so naming stays consistent)
+        #user_annotate_children(child, prefix=f"{full_name}.", use_backward=use_backward)
+
+        ## Only annotate leaf modules → avoids clutter
+        #if len(list(child.children())) > 0:
+            #continue
+
+        ## Avoid double annotation
+        #if hasattr(child, "_anemoi_annotated"):
+            #continue
+        #child._anemoi_annotated = True
+
+        ## ---- FORWARD PRE HOOK ----
+        #def make_pre_hook(m):
+            #def pre_hook(module, inputs):
+                #module._anemoi_fwd = torch.profiler.record_function(f"anemoi-{m}.forward")
+                #module._anemoi_fwd.__enter__()
+            #return pre_hook
+
+        ## ---- FORWARD POST HOOK ----
+        #def make_post_hook(m):
+            #def post_hook(module, inputs, output):
+                #module._anemoi_fwd.__exit__(None, None, None)
+
+                #if not use_backward:
+                    #return
+
+                #t = _extract_tensor(output)
+                #if t is None:
+                    #return
+
+                ## One backward hook per module (coarse but stable)
+                #def backward_hook(grad, _m=m):
+                    #with torch.autograd.profiler.record_function(f"anemoi-{_m}.backward"):
+                        #return grad
+
+                #t.register_hook(backward_hook)
+
+            #return post_hook
+
+        #child.register_forward_pre_hook(make_pre_hook(marker))
+        #child.register_forward_hook(make_post_hook(marker))
+
+    #return model

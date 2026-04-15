@@ -613,9 +613,8 @@ class AnemoiTrainer(ABC):
         )
 
         self.prepare_compilation()
-
-        LOGGER.debug("Starting training..")
         user_annotate_children(self.model)
+        LOGGER.debug("Starting training..")
         trainer.fit(**self.fit_parameters)
 
         if self.config.diagnostics.print_memory_summary:
