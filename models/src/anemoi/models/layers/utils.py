@@ -216,6 +216,175 @@ def user_annotate_children(model: nn.Module, prefix: str = '', use_backward: boo
 
     return model
 
+#def user_annotate_children(
+    #model: nn.Module,
+    #prefix: str = ""
+#) -> nn.Module:
+    #"""
+    #Annotate all modules with profiler markers for forward pass only.
+
+    #Uses forward_pre_hook / forward_hook to create a proper span
+    #around the forward execution.
+
+    #Naming matches original scheme:
+        #anemoi-<ClassName>-<hierarchy>.forward
+    #"""
+
+    #def _make_marker(name: str, module: nn.Module) -> str:
+        #parts = [part for part in name.split('.') if not part.isdigit()]
+        #return f"{module.__class__.__name__}-{'.'.join(parts)}"
+
+    #for child_name, child in model.named_children():
+        #full_name = f"{prefix}{child_name}"
+        #marker = _make_marker(full_name, child)
+
+        #if not hasattr(child, "_anemoi_annotated_fwd"):
+            #child._anemoi_annotated_fwd = True
+
+            ## ---- Forward pre-hook (enter range) ----
+            #def make_pre_hook(m: str):
+                #def pre_hook(module, args, kwargs):
+                    #ctx = torch.profiler.record_function(f"anemoi-{m}.forward")
+                    #ctx.__enter__()
+                    #module._anemoi_fwd_ctx = ctx
+                    #return args, kwargs
+                #return pre_hook
+
+            ## ---- Forward post-hook (exit range) ----
+            #def make_post_hook():
+                #def post_hook(module, args, kwargs, output):
+                    #ctx = getattr(module, "_anemoi_fwd_ctx", None)
+                    #if ctx is not None:
+                        #ctx.__exit__(None, None, None)
+                        #module._anemoi_fwd_ctx = None
+                    #return output
+                #return post_hook
+
+            #child.register_forward_pre_hook(
+                #make_pre_hook(marker),
+                #with_kwargs=True,
+                #prepend=True,
+            #)
+
+            #child.register_forward_hook(
+                #make_post_hook(),
+                #with_kwargs=True,
+                #prepend=False,
+            #)
+
+        ## recurse
+        #user_annotate_children(child, prefix=f"{full_name}.")
+
+    #return model
+#Hooks
+#def user_annotate_children(model: nn.Module, prefix: str = '', use_backward: bool = True) -> nn.Module:
+    #"""Annotate all modules with profiler markers for forward and optionally backward.
+
+    #Forward: wraps module.forward in a record_function context manager.
+    #Backward: attaches tensor hooks to both INPUT and OUTPUT tensors of each module.
+              #The hook on the output fires first (backward is reversed), opening a range.
+              #The hook on the input fires second, closing the range.
+
+    #Parameters
+    #----------
+    #model : nn.Module
+        #The model to annotate.
+    #prefix : str
+        #Prefix for the annotation names (builds hierarchical names).
+    #use_backward : bool
+        #If True, also annotate backward pass using paired tensor hooks.
+        #If False, only annotate forward with record_function context manager.
+
+    #Returns
+    #-------
+    #nn.Module
+        #The annotated model (modified in-place).
+    #"""
+
+    #def _make_marker(name: str, module: nn.Module) -> str:
+        #parts = [part for part in name.split('.') if not part.isdigit()]
+        #return f"{module.__class__.__name__}-{'.'.join(parts)}"
+
+    #def _extract_tensor(obj):
+        #"""Return first tensor requiring grad from nested structures."""
+        #if isinstance(obj, torch.Tensor) and obj.requires_grad:
+            #return obj
+        #if isinstance(obj, (list, tuple)):
+            #for item in obj:
+                #tensor = _extract_tensor(item)
+                #if tensor is not None:
+                    #return tensor
+        #if isinstance(obj, dict):
+            #for item in obj.values():
+                #tensor = _extract_tensor(item)
+                #if tensor is not None:
+                    #return tensor
+        #return None
+
+    #for child_name, child in model.named_children():
+        #full_name = f"{prefix}{child_name}"
+        #marker = _make_marker(full_name, child)
+
+        ## Register hooks only once; this preserves original forward signatures.
+        #if not hasattr(child, "anemoi_profiler_annotated"):
+            #child.anemoi_profiler_annotated = True
+
+            #def make_pre_hook(m):
+                #def pre_hook(module, _inputs):
+                    #module.anemoi_forward_ctx = torch.profiler.record_function(f"anemoi-{m}.forward")
+                    #module.anemoi_forward_ctx.__enter__()
+                #return pre_hook
+
+            #def make_post_hook(m, annotate_bwd):
+                #def post_hook(module, _inputs, output):
+                    #ctx = getattr(module, "anemoi_forward_ctx", nullcontext())
+                    #ctx.__exit__(None, None, None)
+                    #module.anemoi_forward_ctx = None
+
+                    #if not annotate_bwd:
+                        #return output
+
+                    #out_tensor = _extract_tensor(output)
+                    #if out_tensor is None:
+                        #return output
+
+                    #def backward_hook(grad, _m=m):
+                        #with torch.autograd.profiler.record_function(f"anemoi-{_m}.backward"):
+                            #return grad
+
+                    #out_tensor.register_hook(backward_hook)
+                    #return output
+                #return post_hook
+
+            #child.register_forward_pre_hook(make_pre_hook(marker))
+            #child.register_forward_hook(make_post_hook(marker, use_backward))
+
+        #user_annotate_children(child, prefix=f"{full_name}.", use_backward=use_backward)
+
+    #return model
+
+#def user_annotate_children(model: nn.Module, prefix: str = '') -> nn.Module:
+    #"""Wrap forward method of each module recursively for debugging."""
+    
+    #for child_name, child in model.named_children():
+        ## Store original forward if not already stored
+        #if not hasattr(child, "_original_forward"):
+            #child._original_forward = child.forward
+            
+            ## Create wrapped forward
+            #def make_wrapped_forward(module):
+                #def wrapped_forward(*args, **kwargs):
+                    #return module._original_forward(*args, **kwargs)
+                #return wrapped_forward
+            
+            #child.forward = make_wrapped_forward(child)
+        
+        ## Recurse to children
+        #print(prefix + child_name)
+        #user_annotate_children(child, prefix=f"{prefix}{child_name}.")
+    
+    #return model
+
 #def user_annotate_children(model: nn.Module, prefix: str = '') -> nn.Module:
     #def add_annotations_to_forward(name, module):
         ## ensure original forward is stored only once
