@@ -11,6 +11,7 @@ from cProfile import label
 import json
 import logging
 import os
+import pickle
 from collections import defaultdict
 from pathlib import Path
 from typing import Optional, Union
@@ -1210,6 +1211,246 @@ def print_global_contributors_breakdown(df: pd.DataFrame, gpu: bool = True) -> N
     
     console.print()
 
+def _fmt_bytes(num_bytes: float) -> str:
+    """Format a byte count as a human-readable string."""
+    b = float(num_bytes or 0)
+    for unit in ("B", "KB", "MB", "GB"):
+        if abs(b) < 1024:
+            return f"{b:.2f} {unit}"
+        b /= 1024
+    return f"{b:.2f} TB"
+
+
+def memory_breakdown(
+    target: Union[str, Path],
+    pickle_name: str = "memory_snapshot.pickle",
+    trace_df: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """Summarise allocating memory events and peak allocated memory.
+
+    Reads a PyTorch CUDA memory snapshot pickle (produced by
+    ``torch.cuda.memory._dump_snapshot``) and reports, per device, the
+    number of allocation events, total bytes allocated over the run, and
+    the peak allocated memory observed (running max of alloc - free).
+
+    If ``trace_df`` is provided (a DataFrame returned by
+    :func:`trace_to_dataframe`), the function additionally tries to map the
+    timestamp of the peak allocation to merged user-annotation intervals
+    matching ``model.encoder``, ``model.processor`` or ``model.decoder``.
+
+    Parameters
+    ----------
+    target : str or Path
+        Either a directory containing ``memory_snapshot.pickle`` or a
+        direct path to the snapshot pickle file.
+    pickle_name : str
+        Name of the snapshot file to look for when ``target`` is a directory.
+    trace_df : pd.DataFrame, optional
+        Trace DataFrame to use for peak-time → annotation mapping.
+
+    Returns
+    -------
+    pd.DataFrame
+        Per-device summary with columns:
+        ``device``, ``alloc_events``, ``free_events``, ``total_alloc_bytes``,
+        ``peak_alloc_bytes``, ``peak_time_us``, ``final_alloc_bytes``.
+    """
+    path = Path(target)
+    if path.is_dir():
+        path = path / pickle_name
+    if not path.exists():
+        LOGGER.warning("Memory snapshot pickle not found at %s", path)
+        return pd.DataFrame()
+
+    with open(path, "rb") as f:
+        snapshot = pickle.load(f)
+
+    if not isinstance(snapshot, dict):
+        LOGGER.warning("Unexpected snapshot format in %s: %s", path, type(snapshot).__name__)
+        return pd.DataFrame()
+
+    device_traces = snapshot.get("device_traces", [])
+    # Normalise to a per-device mapping of event lists.
+    traces_by_device: dict[int, list] = defaultdict(list)
+    if isinstance(device_traces, list) and device_traces and all(isinstance(x, list) for x in device_traces):
+        for device_id, events in enumerate(device_traces):
+            traces_by_device[device_id] = [e for e in events if isinstance(e, dict)]
+    elif isinstance(device_traces, list):
+        for ev in device_traces:
+            if isinstance(ev, dict):
+                traces_by_device[int(ev.get("device", 0) or 0)].append(ev)
+    elif isinstance(device_traces, dict):
+        for raw_device, events in device_traces.items():
+            try:
+                device_id = int(raw_device)
+            except (TypeError, ValueError):
+                device_id = 0
+            if isinstance(events, list):
+                traces_by_device[device_id] = [e for e in events if isinstance(e, dict)]
+
+    rows = []
+    for device_id in sorted(traces_by_device):
+        events = traces_by_device[device_id]
+        if not events:
+            continue
+        alloc_events = 0
+        free_events = 0
+        total_alloc = 0
+        running = 0
+        peak = 0
+        peak_time_us: Optional[float] = None
+        for ev in events:
+            action = str(ev.get("action", "")).lower()
+            size = int(ev.get("size", ev.get("num_bytes", 0)) or 0)
+            # Snapshot device-trace events typically carry "time_us" (microseconds).
+            t_us = ev.get("time_us")
+            if t_us is None and "time_ns" in ev:
+                t_us = ev["time_ns"] / 1e3
+            # Treat allocator-side allocations and segment allocations as additions.
+            if action in ("alloc", "segment_alloc"):
+                alloc_events += 1
+                total_alloc += size
+                running += size
+                if running > peak:
+                    peak = running
+                    if t_us is not None:
+                        peak_time_us = float(t_us)
+            elif action in ("free_completed", "segment_free"):
+                free_events += 1
+                running -= size
+        if alloc_events == 0 and free_events == 0:
+            continue
+        rows.append(
+            {
+                "device": f"cuda:{device_id}",
+                "alloc_events": alloc_events,
+                "free_events": free_events,
+                "total_alloc_bytes": total_alloc,
+                "peak_alloc_bytes": peak,
+                "peak_time_us": peak_time_us,
+                "final_alloc_bytes": running,
+            }
+        )
+
+    df = pd.DataFrame(rows)
+
+    table = Table(
+        title=f"[bold]Memory Snapshot Summary[/bold] [dim]({path})[/dim]",
+        title_justify="left",
+        box=box.SIMPLE_HEAD,
+        header_style="bold cyan",
+    )
+    table.add_column("Device", style="bold")
+    table.add_column("Alloc events", justify="right")
+    table.add_column("Free events", justify="right")
+    table.add_column("Total allocated", justify="right")
+    table.add_column("Peak allocated", justify="right")
+    table.add_column("Final allocated", justify="right")
+
+    if df.empty:
+        table.add_row("—", "0", "0", "0 B", "0 B", "0 B")
+    else:
+        for _, r in df.iterrows():
+            table.add_row(
+                r["device"],
+                f"{int(r['alloc_events'])}",
+                f"{int(r['free_events'])}",
+                _fmt_bytes(r["total_alloc_bytes"]),
+                f"[yellow]{_fmt_bytes(r['peak_alloc_bytes'])}[/yellow]",
+                _fmt_bytes(r["final_alloc_bytes"]),
+            )
+
+    console.print(table)
+
+    # ── Map peak allocation time to model.{encoder,processor,decoder} annotations ──
+    if trace_df is not None and not df.empty and not trace_df.empty:
+        # Normalize trace input so mapping code can rely on `end_time`.
+        trace_df = _load_df(trace_df)
+        _print_peak_annotation_mapping(df, trace_df)
+
+    return df
+
+
+def _print_peak_annotation_mapping(mem_df: pd.DataFrame, trace_df: pd.DataFrame) -> None:
+    """Map per-device peak-memory timestamps to merged model.* annotation intervals.
+
+    Annotation intervals are built from ``user_annotation`` events whose name
+    contains ``model.encoder``, ``model.processor`` or ``model.decoder``,
+    merged within each section. The peak time (in microseconds, taken from
+    the snapshot ``time_us`` field) is then located inside these intervals
+    using the trace's own time base. Note that the snapshot clock and trace
+    clock are only directly comparable when both were recorded by the same
+    profiler run; otherwise this mapping is best-effort.
+    """
+    sections = {
+        "model.encoder": "model.encoder",
+        "model.processor": "model.processor",
+        "model.decoder": "model.decoder",
+    }
+    ann = trace_df[trace_df["cat"].isin(["user_annotation", "gpu_user_annotation"])]
+    merged_by_section: dict[str, pd.DataFrame] = {}
+    for label_, pattern in sections.items():
+        sub = ann[ann["name"].str.contains(pattern, regex=False, na=False)].sort_values("ts")
+        if sub.empty:
+            merged_by_section[label_] = pd.DataFrame(columns=["ts", "end_time"])
+        else:
+            merged_by_section[label_] = merge_overlapping_intervals_df(sub[["ts", "end_time"]])
+
+    trace_min = float(trace_df["ts"].min())
+    trace_max = float(trace_df["end_time"].max())
+
+    table = Table(
+        title="[bold]Peak Memory → Annotation Mapping[/bold]",
+        title_justify="left",
+        box=box.SIMPLE_HEAD,
+        header_style="bold cyan",
+    )
+    table.add_column("Device", style="bold")
+    table.add_column("Peak", justify="right")
+    table.add_column("Peak time (us)", justify="right")
+    table.add_column("Matched section", justify="left")
+    table.add_column("Interval (us)", justify="right")
+
+    any_row = False
+    for _, r in mem_df.iterrows():
+        peak_t = r.get("peak_time_us")
+        if peak_t is None or pd.isna(peak_t):
+            table.add_row(r["device"], _fmt_bytes(r["peak_alloc_bytes"]), "—", "[dim]no time_us in snapshot[/dim]", "—")
+            any_row = True
+            continue
+
+        # If the snapshot clock is clearly outside the trace window, still try
+        # but flag it.
+        out_of_range = peak_t < trace_min or peak_t > trace_max
+
+        match_label = "[dim]none[/dim]"
+        match_interval = "—"
+        for label_, intervals in merged_by_section.items():
+            if intervals.empty:
+                continue
+            hit = intervals[(intervals["ts"] <= peak_t) & (intervals["end_time"] >= peak_t)]
+            if not hit.empty:
+                row0 = hit.iloc[0]
+                match_label = label_
+                match_interval = f"[{int(row0['ts'])}, {int(row0['end_time'])}]"
+                break
+
+        if out_of_range and match_label == "[dim]none[/dim]":
+            match_label = "[yellow]none (snapshot/trace clocks differ)[/yellow]"
+
+        table.add_row(
+            r["device"],
+            _fmt_bytes(r["peak_alloc_bytes"]),
+            f"{int(peak_t)}",
+            match_label,
+            match_interval,
+        )
+        any_row = True
+
+    if any_row:
+        console.print(table)
+
+
 def find_first_trace_file(dirpath: Union[str, Path]) -> Optional[str]:
     """Find the first ``*.pt.trace.json`` file in a directory.
 
@@ -1888,6 +2129,15 @@ def analyse_trace(
         console.print("\n")
         gpu_plot_path = str(Path(dirpath) / f"{trace_stem}.gpu_time_breakdown.png") if plot else ""
         gpu_time_breakdown(df, plot=plot, savepath=gpu_plot_path)
+
+    # ── Memory snapshot breakdown ─────────────────────────────────────────────
+    mem_pickle = Path(dirpath) / "memory_snapshot.pickle"
+    if mem_pickle.exists():
+        console.rule("[bold]MEMORY BREAKDOWN[/bold]", align="left", style="dim cyan")
+        console.print("\n")
+        # Use rank 0's trace (the snapshot is typically only recorded on device 0).
+        _, _, _, df_mem = rank_data[0]
+        memory_breakdown(mem_pickle, trace_df=df_mem)
 
     if not detailed:
         console.print("[dim]Skipping detailed analysis.[/dim]")
